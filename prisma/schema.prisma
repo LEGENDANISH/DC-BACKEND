@@ -1,0 +1,405 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(cuid())
+  username      String   @unique
+  displayName   String?
+  email         String   @unique
+    password      String      // 🔑 add this field
+
+  avatar        String?
+  bio           String?
+  isBot         Boolean  @default(false)
+  status        UserStatus @default(OFFLINE)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relationships
+  ownedServers  Server[] @relation("ServerOwner")
+  memberships   ServerMember[]
+  messages      Message[]
+  reactions     Reaction[]
+  friendships   Friendship[] @relation("UserFriendships")
+  friendRequests Friendship[] @relation("FriendRequests")
+  directMessages DirectMessage[]
+  voiceStates   VoiceState[]
+    participants   ChannelParticipant[]       // 👈 add this
+
+
+  @@map("users")
+}
+
+model Server {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  icon        String?
+  banner      String?
+  ownerId     String
+  isPublic    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relationships
+  owner       User @relation("ServerOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members     ServerMember[]
+  channels    Channel[]
+  roles       Role[]
+  emojis      Emoji[]
+  invites     Invite[]
+
+  @@map("servers")
+}
+
+model ServerMember {
+  id        String   @id @default(cuid())
+  userId    String
+  serverId  String
+  nickname  String?
+  joinedAt  DateTime @default(now())
+    timeoutUntil DateTime?   
+  
+  // Relationships
+  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server    Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  roles     RoleMember[]
+
+  @@unique([userId, serverId])
+  @@map("server_members")
+}
+
+model ChannelParticipant {
+  id        String   @id @default(cuid())
+  userId    String
+  channelId String
+
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channelId])
+  @@map("channel_participants")
+}
+
+
+
+model Role {
+  id          String   @id @default(cuid())
+  name        String
+  color       String?
+  serverId    String
+  position    Int      @default(0)
+  permissions BigInt   @default(0)
+  mentionable Boolean  @default(true)
+  hoisted     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  // Relationships
+  server      Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members     RoleMember[]
+
+  @@map("roles")
+}
+
+model RoleMember {
+  id       String @id @default(cuid())
+  memberId String
+  roleId   String
+
+  // Relationships
+  member   ServerMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  role     Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([memberId, roleId])
+  @@map("role_members")
+}
+
+model Channel {
+  id          String      @id @default(cuid())
+  name        String
+  type        ChannelType
+  topic       String?
+  position    Int         @default(0)
+  serverId    String?
+  categoryId  String?
+  nsfw        Boolean     @default(false)
+  bitrate     Int?        // For voice channels
+  userLimit   Int?        // For voice channels
+  slowMode    Int         @default(0)
+    isDM        Boolean     @default(false)   // 👈 add this
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relationships
+  server      Server? @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  category    Channel? @relation("ChannelCategory", fields: [categoryId], references: [id])
+  children    Channel[] @relation("ChannelCategory")
+  messages    Message[]
+  permissions ChannelPermission[]
+  voiceStates VoiceState[]
+    participants ChannelParticipant[]         // 👈 add this
+
+
+  @@map("channels")
+}
+
+model Message {
+  id          String      @id @default(cuid())
+  content     String?
+  authorId    String
+  channelId   String
+  replyToId   String?
+  edited      Boolean     @default(false)
+  pinned      Boolean     @default(false)
+  type        MessageType @default(DEFAULT)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Relationships
+  author      User @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  channel     Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  replyTo     Message? @relation("MessageReply", fields: [replyToId], references: [id])
+  replies     Message[] @relation("MessageReply")
+  attachments Attachment[]
+  reactions   Reaction[]
+  mentions    MessageMention[]
+  embeds      Embed[]
+
+  @@map("messages")
+}
+
+model DirectMessage {
+  id        String   @id @default(cuid())
+  content   String?
+  authorId  String
+  targetId  String
+  edited    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relationships
+  author    User @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  attachments Attachment[]
+
+  @@map("direct_messages")
+}
+
+model Attachment {
+  id            String   @id @default(cuid())
+  filename      String
+  url           String
+  size          Int
+  contentType   String
+  messageId     String?
+  dmMessageId   String?
+  createdAt     DateTime @default(now())
+
+  // Relationships
+  message       Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  directMessage DirectMessage? @relation(fields: [dmMessageId], references: [id], onDelete: Cascade)
+
+  @@map("attachments")
+}
+
+model Reaction {
+  id        String   @id @default(cuid())
+  userId    String
+  messageId String
+  emoji     String
+  createdAt DateTime @default(now())
+
+  // Relationships
+  user      User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, messageId, emoji])
+  @@map("reactions")
+}
+
+model Emoji {
+  id        String   @id @default(cuid())
+  name      String
+  url       String?
+  serverId  String?
+  animated  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  // Relationships
+  server    Server? @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@unique([name, serverId])
+  @@map("emojis")
+}
+
+model Friendship {
+  id         String           @id @default(cuid())
+  senderId   String
+  receiverId String
+  status     FriendshipStatus @default(PENDING)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  // Relationships
+  sender     User @relation("UserFriendships", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver   User @relation("FriendRequests", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@unique([senderId, receiverId])
+  @@map("friendships")
+}
+
+model Invite {
+  id        String    @id @default(cuid())
+  code      String    @unique
+  serverId  String
+  creatorId String?
+  maxUses   Int?
+  uses      Int       @default(0)
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+
+  // Relationships
+  server    Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+
+  @@map("invites")
+}
+
+model VoiceState {
+  id            String   @id @default(cuid())
+  userId        String
+  channelId     String?
+  muted         Boolean  @default(false)
+  deafened      Boolean  @default(false)
+  selfMuted     Boolean  @default(false)
+  selfDeafened  Boolean  @default(false)
+  streaming     Boolean  @default(false)
+  video         Boolean  @default(false)
+  updatedAt     DateTime @updatedAt
+
+  // Relationships
+  user          User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel       Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+
+  @@unique([userId])
+  @@map("voice_states")
+}
+
+model ChannelPermission {
+  id         String @id @default(cuid())
+  channelId  String
+  roleId     String?
+  userId     String?
+  allow      BigInt @default(0)
+  deny       BigInt @default(0)
+
+  // Relationships
+  channel    Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@map("channel_permissions")
+}
+
+model MessageMention {
+  id        String @id @default(cuid())
+  messageId String
+  userId    String
+
+  // Relationships
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId])
+  @@map("message_mentions")
+}
+
+model Embed {
+  id          String   @id @default(cuid())
+  messageId   String
+  title       String?
+  description String?
+  url         String?
+  color       Int?
+  timestamp   DateTime?
+  authorName  String?
+  authorUrl   String?
+  authorIcon  String?
+  footerText  String?
+  footerIcon  String?
+  imageUrl    String?
+  thumbnailUrl String?
+
+  // Relationships
+  message     Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  fields      EmbedField[]
+
+  @@map("embeds")
+}
+
+model EmbedField {
+  id      String  @id @default(cuid())
+  embedId String
+  name    String
+  value   String
+  inline  Boolean @default(false)
+
+  // Relationships
+  embed   Embed @relation(fields: [embedId], references: [id], onDelete: Cascade)
+
+  @@map("embed_fields")
+}
+
+// Enums
+enum UserStatus {
+  ONLINE
+  IDLE
+  DO_NOT_DISTURB
+  OFFLINE
+}
+
+enum ChannelType {
+  TEXT
+  VOICE
+  CATEGORY
+  ANNOUNCEMENT
+  STAGE
+  FORUM
+}
+
+enum MessageType {
+  DEFAULT
+  RECIPIENT_ADD
+  RECIPIENT_REMOVE
+  CALL
+  CHANNEL_NAME_CHANGE
+  CHANNEL_ICON_CHANGE
+  PINS_ADD
+  GUILD_MEMBER_JOIN
+  USER_PREMIUM_GUILD_SUBSCRIPTION
+  USER_PREMIUM_GUILD_SUBSCRIPTION_TIER_1
+  USER_PREMIUM_GUILD_SUBSCRIPTION_TIER_2
+  USER_PREMIUM_GUILD_SUBSCRIPTION_TIER_3
+  CHANNEL_FOLLOW_ADD
+  GUILD_DISCOVERY_DISQUALIFIED
+  GUILD_DISCOVERY_REQUALIFIED
+  GUILD_DISCOVERY_GRACE_PERIOD_INITIAL_WARNING
+  GUILD_DISCOVERY_GRACE_PERIOD_FINAL_WARNING
+  THREAD_CREATED
+  REPLY
+  CHAT_INPUT_COMMAND
+  THREAD_STARTER_MESSAGE
+  GUILD_INVITE_REMINDER
+  CONTEXT_MENU_COMMAND
+}
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+  BLOCKED
+}

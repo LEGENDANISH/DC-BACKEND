@@ -1,0 +1,326 @@
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import request from 'supertest';
+import app from './src/api.test'; // adjust path to your main file
+import { PrismaClient } from '@prisma/client';
+import Redis from 'ioredis';
+
+const prisma = new PrismaClient();
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+
+let userToken = '';
+let userId = '';
+let serverId = '';
+let channelId = '';
+let inviteCode = '';
+
+beforeAll(async () => {
+  // Clear test data
+  await prisma.user.deleteMany();
+  await prisma.server.deleteMany();
+  await prisma.channel.deleteMany();
+  await prisma.message.deleteMany();
+  await prisma.invite.deleteMany();
+  await redis.flushall();
+});
+
+afterAll(async () => {
+  await prisma.$disconnect();
+  await redis.quit();
+});
+
+describe('Health Check', () => {
+  it('should return 200 OK', async () => {
+    await request(app).get('/health').expect(200);
+  });
+});
+
+describe('Auth API', () => {
+  it('should register a new user', async () => {
+    const res = await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'testuser',
+        email: 'test@example.com',
+        password: 'password123',
+        displayName: 'Test User'
+      })
+      .expect(201);
+
+    expect(res.body.user).toHaveProperty('id');
+    expect(res.body.user.username).toBe('testuser');
+    expect(res.body.token).toBeDefined();
+
+    userId = res.body.user.id;
+    userToken = res.body.token;
+  });
+
+  it('should not register duplicate user', async () => {
+    await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'testuser',
+        email: 'test@example.com',
+        password: 'password123'
+      })
+      .expect(400);
+  });
+
+  it('should login an existing user', async () => {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'test@example.com',
+        password: 'password123'
+      })
+      .expect(200);
+
+    expect(res.body.user).toHaveProperty('id');
+    expect(res.body.token).toBeDefined();
+    userToken = res.body.token;
+  });
+
+  it('should not login with invalid credentials', async () => {
+    await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'test@example.com',
+        password: 'wrongpassword'
+      })
+      .expect(401);
+  });
+
+  it('should get current user info', async () => {
+    const res = await request(app)
+      .get('/api/users/me')
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+
+    expect(res.body.email).toBe('test@example.com');
+    expect(res.body.id).toBe(userId);
+  });
+
+  it('should logout user', async () => {
+    await request(app)
+      .post('/api/auth/logout')
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+    
+    // Try to use the same token again - should fail
+    await request(app)
+      .get('/api/users/me')
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(401);
+  });
+
+  it('should login again for subsequent tests', async () => {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'test@example.com',
+        password: 'password123'
+      })
+      .expect(200);
+    
+    userToken = res.body.token;
+  });
+});
+
+describe('Server API', () => {
+  it('should create a new server', async () => {
+    const res = await request(app)
+      .post('/api/servers')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({
+        name: 'Test Server',
+        description: 'A test server',
+        isPublic: true
+      })
+      .expect(201);
+
+    expect(res.body.name).toBe('Test Server');
+    expect(res.body.ownerId).toBe(userId);
+    expect(res.body.channels).toHaveLength(2);
+    
+    serverId = res.body.id;
+    channelId = res.body.channels.find((c: any) => c.type === 'TEXT').id;
+  });
+
+  it('should fetch servers for user', async () => {
+    const res = await request(app)
+      .get('/api/servers')
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].id).toBe(serverId);
+  });
+
+  it('should fetch a specific server', async () => {
+    const res = await request(app)
+      .get(`/api/servers/${serverId}`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+
+    expect(res.body.id).toBe(serverId);
+    expect(res.body.channels).toBeDefined();
+    expect(res.body.roles).toBeDefined();
+  });
+
+  it('should not fetch server for non-member', async () => {
+    // Create another user
+    const registerRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'nonmember',
+        email: 'nonmember@example.com',
+        password: 'password123'
+      })
+      .expect(201);
+
+    const nonMemberToken = registerRes.body.token;
+
+    await request(app)
+      .get(`/api/servers/${serverId}`)
+      .set('Authorization', `Bearer ${nonMemberToken}`)
+      .expect(403);
+  });
+});
+
+describe('Invite API', () => {
+  it('should create an invite', async () => {
+    const res = await request(app)
+      .post(`/api/servers/${serverId}/invites`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+
+    expect(res.body.code).toBeDefined();
+    expect(res.body.serverId).toBe(serverId);
+    
+    inviteCode = res.body.code;
+  });
+
+  it('should not create invite for non-member', async () => {
+    // Create another user
+    const registerRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'nonmember2',
+        email: 'nonmember2@example.com',
+        password: 'password123'
+      })
+      .expect(201);
+
+    const nonMemberToken = registerRes.body.token;
+
+    await request(app)
+      .post(`/api/servers/${serverId}/invites`)
+      .set('Authorization', `Bearer ${nonMemberToken}`)
+      .expect(403);
+  });
+
+  it('should join server using invite', async () => {
+    // Register a second user
+    const registerRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'joiner',
+        email: 'joiner@example.com',
+        password: 'password123'
+      })
+      .expect(201);
+
+    const joinerToken = registerRes.body.token;
+
+    const res = await request(app)
+      .post(`/api/invites/${inviteCode}/join`)
+      .set('Authorization', `Bearer ${joinerToken}`)
+      .expect(200);
+
+    expect(res.body.message).toBe('Joined server successfully');
+    expect(res.body.server.id).toBe(serverId);
+  });
+
+  it('should not join server twice', async () => {
+    // Login as joiner again
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email: 'joiner@example.com',
+        password: 'password123'
+      })
+      .expect(200);
+
+    const joinerToken = loginRes.body.token;
+
+    await request(app)
+      .post(`/api/invites/${inviteCode}/join`)
+      .set('Authorization', `Bearer ${joinerToken}`)
+      .expect(400);
+  });
+});
+
+describe('Message API', () => {
+  it('should send a message to a channel', async () => {
+    const res = await request(app)
+      .post(`/api/channels/${channelId}/messages`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({
+        content: 'Hello, world!'
+      })
+      .expect(201);
+
+    expect(res.body.content).toBe('Hello, world!');
+    expect(res.body.authorId).toBe(userId);
+  });
+
+  it('should not send message to channel without access', async () => {
+    // Create another user
+    const registerRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'noaccess',
+        email: 'noaccess@example.com',
+        password: 'password123'
+      })
+      .expect(201);
+
+    const noAccessToken = registerRes.body.token;
+
+    await request(app)
+      .post(`/api/channels/${channelId}/messages`)
+      .set('Authorization', `Bearer ${noAccessToken}`)
+      .send({
+        content: 'Should not work'
+      })
+      .expect(403);
+  });
+
+  it('should fetch messages from a channel', async () => {
+    const res = await request(app)
+      .get(`/api/channels/${channelId}/messages`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .expect(200);
+
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].content).toBe('Hello, world!');
+  });
+
+  it('should not fetch messages from channel without access', async () => {
+    // Create another user
+    const registerRes = await request(app)
+      .post('/api/auth/register')
+      .send({
+        username: 'noaccess2',
+        email: 'noaccess2@example.com',
+        password: 'password123'
+      })
+      .expect(201);
+
+    const noAccessToken = registerRes.body.token;
+
+    await request(app)
+      .get(`/api/channels/${channelId}/messages`)
+      .set('Authorization', `Bearer ${noAccessToken}`)
+      .expect(403);
+  });
+});
