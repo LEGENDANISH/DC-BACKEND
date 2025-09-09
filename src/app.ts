@@ -463,7 +463,18 @@ app.post('/api/servers/:serverId/invites', authenticateToken, async (req: AuthRe
       return res.status(400).json({ error: 'Server ID is required' });
     }
 
-    // Ensure user is member
+    // Check if user is owner of the server
+    const server = await prisma.server.findUnique({
+      where: { id: serverId }
+    });
+
+    if (!server) {
+      return res.status(404).json({ error: 'Server not found' });
+    }
+
+    const isOwner = server.ownerId === req.user!.id;
+
+    // Check if user is a member of the server
     const membership = await prisma.serverMember.findUnique({
       where: {
         userId_serverId: {
@@ -472,14 +483,14 @@ app.post('/api/servers/:serverId/invites', authenticateToken, async (req: AuthRe
         }
       }
     });
-    
-    if (!membership) {
-      return res.status(403).json({ error: 'Not a member of this server' });
+
+    if (!isOwner && !membership) {
+      return res.status(403).json({ error: 'Not authorized to create invite for this server' });
     }
 
     const invite = await prisma.invite.create({
       data: {
-        code: Math.random().toString(36).substring(2, 10), // simple random code
+        code: Math.random().toString(36).substring(2, 10), // random short code
         serverId,
         creatorId: req.user!.id,
         maxUses: 5
@@ -492,6 +503,7 @@ app.post('/api/servers/:serverId/invites', authenticateToken, async (req: AuthRe
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 
 //join server using invite code
