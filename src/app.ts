@@ -568,7 +568,7 @@ app.post('/api/invites/:code/join', authenticateToken, async (req: AuthRequest, 
 
 
 // POST /api/servers/:serverId/channels
-app.post('/servers/:serverId/channels', authenticateToken, async (req: AuthRequest, res) => {
+app.post('/api/servers/:serverId/channels', authenticateToken, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
     if (!serverId) return res.status(400).json({ error: 'Server ID is required' });
@@ -610,7 +610,7 @@ app.post('/servers/:serverId/channels', authenticateToken, async (req: AuthReque
  * GET /api/servers/:serverId/channels
  * → List channels in a server (ordered by position)
  */
-app.get("/servers/:serverId/channels",authenticateToken, async (req, res) => {
+app.get("/api/servers/:serverId/channels",authenticateToken, async (req, res) => {
   try {
     const { serverId } = req.params;
 
@@ -692,7 +692,9 @@ app.get("/api/channels/:channelId/messages", authenticateToken, async (req, res)
       skip,
       take: limit,
       include: {
-        author: { select: { id: true, username: true, displayName: true } }, // example
+        author: {
+          select: { id: true, username: true, displayName: true, avatar: true }, // ✅ add avatar here
+        },
         attachments: true,
       },
     });
