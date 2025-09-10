@@ -679,6 +679,7 @@ app.patch("/api/channels/:channelId",authenticateToken, async (req, res) => {
   }
 });
 
+// ✅ GET messages (with correct order oldest → newest)
 app.get("/api/channels/:channelId/messages", authenticateToken, async (req, res) => {
   const { channelId } = req.params;
   const page = parseInt(req.query.page as string) || 1;
@@ -693,61 +694,156 @@ app.get("/api/channels/:channelId/messages", authenticateToken, async (req, res)
       take: limit,
       include: {
         author: {
-          select: { id: true, username: true, displayName: true, avatar: true }, // ✅ add avatar here
+          select: { id: true, username: true, displayName: true, avatar: true },
         },
         attachments: true,
       },
     });
 
-    res.json(messages);
+    // Reverse so frontend always gets oldest → newest
+    res.json(messages.reverse());
   } catch (error) {
-    console.error(error);
+    console.error("Fetch messages error:", error);
     res.status(500).json({ error: "Failed to fetch messages" });
   }
 });
 
 
+// ✅ POST new message (with Redis publish for live updates)
 app.post("/api/channels/:channelId/messages", authenticateToken, async (req: AuthRequest, res) => {
   const { channelId } = req.params;
   const { content, attachments, replyTo } = req.body;
   const userId = req.user!.id;
-if (!channelId) {
-  return res.status(400).json({ error: "Channel ID is required" });
-}
-if(!content && (!attachments || attachments.length === 0)) {
-  return res.status(400).json({ error: "Message content or attachments are required" });
-}
 
-try {
+  if (!channelId) {
+    return res.status(400).json({ error: "Channel ID is required" });
+  }
+  if (!content && (!attachments || attachments.length === 0)) {
+    return res.status(400).json({ error: "Message content or attachments are required" });
+  }
+
+  try {
     const newMessage = await prisma.message.create({
-  data: {
-    content,
-    channelId,
-    authorId: userId,
-    replyToId: replyTo || null,
-    ...(attachments && attachments.length > 0 && {
-      attachments: {
-        create: attachments.map((a: any) => ({
-          url: a.url,
-          filename: a.filename,
-          size: a.size,
-          contentType: a.contentType,
-        })),
+      data: {
+        content,
+        channelId,
+        authorId: userId,
+        replyToId: replyTo || null,
+        ...(attachments && attachments.length > 0 && {
+          attachments: {
+            create: attachments.map((a: any) => ({
+              url: a.url,
+              filename: a.filename,
+              size: a.size,
+              contentType: a.contentType,
+            })),
+          },
+        }),
       },
-    }),
-  },
-  include: {
-    attachments: true,
-    author: {
-      select: { id: true, username: true, displayName: true, avatar: true },
-    },
-  },
-});
+      include: {
+        attachments: true,
+        author: {
+          select: { id: true, username: true, displayName: true, avatar: true },
+        },
+      },
+    });
 
+    // Cache recent messages
+    await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(newMessage));
+    await redis.ltrim(`channel:${channelId}:messages`, 0, 49);
+
+    // Broadcast to WebSocket clients via Redis pub/sub
+    await redis.publish("new_message", JSON.stringify({ channelId, message: newMessage }));
+
+    // Respond to REST caller
     res.status(201).json(newMessage);
   } catch (error) {
     console.error("Send message error:", error);
     res.status(500).json({ error: "Failed to send message" });
+  }
+});
+
+// ✅ PATCH update a message
+app.patch("/api/channels/:channelId/messages/:messageId", authenticateToken, async (req: AuthRequest, res) => {
+  const { channelId, messageId } = req.params;
+  const { content } = req.body;
+  const userId = req.user!.id;
+
+  if (!content || content.trim() === "") {
+    return res.status(400).json({ error: "Message content is required" });
+  }
+if (!messageId) {
+  return res.status(400).json({ error: "Message ID is required" });
+}
+
+  try {
+    // Ensure the user owns the message (or add admin check if needed)
+    const existing = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!existing) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    if (existing.authorId !== userId) {
+      return res.status(403).json({ error: "Not authorized to edit this message" });
+    }
+if (!messageId) {
+  return res.status(400).json({ error: "Message ID is required" });
+}
+
+    const updatedMessage = await prisma.message.update({
+      where: { id: messageId },
+      data: { content },
+      include: {
+        attachments: true,
+        author: {
+          select: { id: true, username: true, displayName: true, avatar: true },
+        },
+      },
+    });
+
+    // Update cache (optional: replace message in list)
+    await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(updatedMessage));
+    await redis.ltrim(`channel:${channelId}:messages`, 0, 49);
+
+    // Publish update so WebSocket clients see it live
+    await redis.publish("message_update", JSON.stringify({ channelId, message: updatedMessage }));
+
+    res.json(updatedMessage);
+  } catch (error) {
+    console.error("Update message error:", error);
+    res.status(500).json({ error: "Failed to update message" });
+  }
+});
+
+
+// ✅ DELETE a message
+app.delete("/api/channels/:channelId/messages/:messageId", authenticateToken, async (req: AuthRequest, res) => {
+  const { channelId, messageId } = req.params;
+  const userId = req.user!.id;
+if (!messageId) {
+  return res.status(400).json({ error: "Message ID is required" });
+}
+
+  try {
+    const existing = await prisma.message.findUnique({ where: { id: messageId } });
+    if (!existing) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    if (existing.authorId !== userId) {
+      return res.status(403).json({ error: "Not authorized to delete this message" });
+    }
+
+    const deleted = await prisma.message.delete({
+      where: { id: messageId },
+      select: { id: true, channelId: true },
+    });
+
+    // Publish delete event
+    await redis.publish("message_delete", JSON.stringify({ channelId, messageId: deleted.id }));
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Delete message error:", error);
+    res.status(500).json({ error: "Failed to delete message" });
   }
 });
 

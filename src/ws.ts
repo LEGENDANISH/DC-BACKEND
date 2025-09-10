@@ -757,23 +757,34 @@ export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: 
   });
 
   // Redis subscriber for scaling across instances
-  subscriber.subscribe('new_message', 'user_status_update', 'server_update');
+// Redis subscriber for scaling across instances
+subscriber.subscribe('new_message', 'message_update', 'message_delete', 'user_status_update', 'server_update');
 
-  subscriber.on('message', (channel, message) => {
-    const data = JSON.parse(message);
+subscriber.on('message', (channel, message) => {
+  const data = JSON.parse(message);
 
-    switch (channel) {
-      case 'new_message':
-        io.to(`channel:${data.channelId}`).emit('message', data.message);
-        break;
-      case 'user_status_update':
-        io.emit('user_status_update', data);
-        break;
-      case 'server_update':
-        io.to(`server:${data.serverId}`).emit('server_update', data);
-        break;
-    }
-  });
+  switch (channel) {
+    case 'new_message':
+      io.to(`channel:${data.channelId}`).emit('message', data.message);
+      break;
+
+    case 'message_update':
+      io.to(`channel:${data.channelId}`).emit('message_update', data.message);
+      break;
+
+    case 'message_delete':
+      io.to(`channel:${data.channelId}`).emit('message_delete', { messageId: data.messageId });
+      break;
+
+    case 'user_status_update':
+      io.emit('user_status_update', data);
+      break;
+
+    case 'server_update':
+      io.to(`server:${data.serverId}`).emit('server_update', data);
+      break;
+  }
+});
 
   // Cleanup typing indicators every 30 seconds
   setInterval(async () => {
