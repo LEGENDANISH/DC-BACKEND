@@ -1,0 +1,18 @@
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+  const socket = io("http://localhost:3000", {
+    auth: { token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbWZjbHR4ejUwMDA0aTJmc2FsbWtvczFkIiwiZW1haWwiOiJhc2hpc2gxMjNAZ21haWwuY29tIiwiaWF0IjoxNzU3NTI4NjkyLCJleHAiOjE3NTgxMzM0OTJ9.dVHyv1jNy6LVtL4TE7d7BDYwpJCI0M1MDFhrI6Co7FU" }
+  });
+
+  socket.on("connect", () => {
+    console.log("Connected!", socket.id);
+  });
+
+  socket.on("ready", (data) => {
+    console.log("Ready event:", data);
+  });
+
+  socket.on("message", (msg) => {
+    console.log("New message:", msg);
+  });
+</script>
