@@ -35,7 +35,7 @@ interface VoiceStateData {
   video: boolean;
 }
 
-export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: Redis) {
+export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: Redis,app :Express.Application) {
   const io = new SocketIOServer(server, {
     cors: {
     origin: ['http://localhost:3000', 'http://127.0.0.1:5500','http://localhost:5173'], // 👈 add both origins
@@ -44,7 +44,7 @@ export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: 
     },
     transports: ['websocket', 'polling']
   });
-
+  (app as any).set('io', io); // <-- Store the io instance on the app object
   // Redis pub/sub for scaling across multiple instances
   const publisher = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
   const subscriber = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
@@ -761,12 +761,15 @@ export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: 
 subscriber.subscribe('new_message', 'message_update', 'message_delete', 'user_status_update', 'server_update');
 
 subscriber.on('message', (channel, message) => {
+ console.log(`Debug - Redis subscriber received message on channel: ${channel}`); // Add this log
   const data = JSON.parse(message);
-
+  
   switch (channel) {
     case 'new_message':
+console.log(`Debug - Handling new_message from Redis for channel ID: ${data.channelId}`); // Add this log
       io.to(`channel:${data.channelId}`).emit('message', data.message);
-      break;
+      console.log(`Debug - Message emitted to room channel:${data.channelId} via Redis handler`); // Add this log
+            break;
 
     case 'message_update':
       io.to(`channel:${data.channelId}`).emit('message_update', data.message);

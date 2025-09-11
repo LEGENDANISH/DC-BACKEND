@@ -710,6 +710,7 @@ app.get("/api/channels/:channelId/messages", authenticateToken, async (req, res)
 
 
 // ✅ POST new message (with Redis publish for live updates)
+// ✅ POST new message (with local emit + Redis publish)
 app.post("/api/channels/:channelId/messages", authenticateToken, async (req: AuthRequest, res) => {
   const { channelId } = req.params;
   const { content, attachments, replyTo } = req.body;
@@ -729,7 +730,7 @@ app.post("/api/channels/:channelId/messages", authenticateToken, async (req: Aut
         channelId,
         authorId: userId,
         replyToId: replyTo || null,
-        ...(attachments && attachments.length > 0 && {
+        ...(attachments?.length > 0 && {
           attachments: {
             create: attachments.map((a: any) => ({
               url: a.url,
@@ -748,20 +749,27 @@ app.post("/api/channels/:channelId/messages", authenticateToken, async (req: Aut
       },
     });
 
-    // Cache recent messages
+    // ✅ Cache recent messages
     await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(newMessage));
     await redis.ltrim(`channel:${channelId}:messages`, 0, 49);
 
-    // Broadcast to WebSocket clients via Redis pub/sub
+    // ✅ Emit directly to sockets in this process
+    const io = req.app.get("io");
+    if (io) {
+      io.to(`channel:${channelId}`).emit("message", newMessage);
+    }
+
+    // ✅ Publish to Redis for other instances
     await redis.publish("new_message", JSON.stringify({ channelId, message: newMessage }));
 
-    // Respond to REST caller
+    // ✅ Respond to REST caller
     res.status(201).json(newMessage);
   } catch (error) {
     console.error("Send message error:", error);
     res.status(500).json({ error: "Failed to send message" });
   }
 });
+
 
 // ✅ PATCH update a message
 app.patch("/api/channels/:channelId/messages/:messageId", authenticateToken, async (req: AuthRequest, res) => {
@@ -1258,160 +1266,160 @@ app.delete("/channels/:channelId", async (req, res) => {
   }
 });
 
-// Message routes
-app.post('/api/channels/:channelId/messages', authenticateToken, async (req: AuthRequest, res) => {
-  try {
-    const channelId = req.params.channelId as string;  // ✅
-    const { content, replyToId, attachments } = sendMessageSchema.parse(req.body);
+// // Message routes
+// app.post('/api/channels/:channelId/messages', authenticateToken, async (req: AuthRequest, res) => {
+//   try {
+//     const channelId = req.params.channelId as string;  // ✅
+//     const { content, replyToId, attachments } = sendMessageSchema.parse(req.body);
 
-    // Verify channel access
-    const channel = await prisma.channel.findUnique({
-      where: { id: channelId },
-      include: { server: true }
-    });
+//     // Verify channel access
+//     const channel = await prisma.channel.findUnique({
+//       where: { id: channelId },
+//       include: { server: true }
+//     });
 
-    if (!channel) {
-      return res.status(404).json({ error: 'Channel not found' });
-    }
+//     if (!channel) {
+//       return res.status(404).json({ error: 'Channel not found' });
+//     }
 
-    // Check if user is member of the server
-    if (channel.serverId) {
-      const membership = await prisma.serverMember.findUnique({
-        where: {
-          userId_serverId: {
-            userId: req.user!.id,
-            serverId: channel.serverId
-          }
-        }
-      });
+//     // Check if user is member of the server
+//     if (channel.serverId) {
+//       const membership = await prisma.serverMember.findUnique({
+//         where: {
+//           userId_serverId: {
+//             userId: req.user!.id,
+//             serverId: channel.serverId
+//           }
+//         }
+//       });
 
-      if (!membership) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-    }
-const message = await prisma.message.create({
-  data: {
-    content: content ?? null,
-    authorId: req.user!.id,
-    channelId,
-    replyToId: replyToId ?? null,
-    ...(attachments?.length ? {
-      attachments: {
-        create: attachments.map(att => ({
-          filename: att.filename,
-          url: att.url,
-          size: att.size,
-          contentType: att.contentType
-        }))
-      }
-    } : {})
-  },
-  include: {
-    author: {
-      select: { id: true, username: true, displayName: true, avatar: true }
-    },
-    attachments: true,
-    replyTo: {
-      include: {
-        author: {
-          select: { id: true, username: true, displayName: true, avatar: true }
-        }
-      }
-    }
-  }
-});
+//       if (!membership) {
+//         return res.status(403).json({ error: 'Access denied' });
+//       }
+//     }
+// const message = await prisma.message.create({
+//   data: {
+//     content: content ?? null,
+//     authorId: req.user!.id,
+//     channelId,
+//     replyToId: replyToId ?? null,
+//     ...(attachments?.length ? {
+//       attachments: {
+//         create: attachments.map(att => ({
+//           filename: att.filename,
+//           url: att.url,
+//           size: att.size,
+//           contentType: att.contentType
+//         }))
+//       }
+//     } : {})
+//   },
+//   include: {
+//     author: {
+//       select: { id: true, username: true, displayName: true, avatar: true }
+//     },
+//     attachments: true,
+//     replyTo: {
+//       include: {
+//         author: {
+//           select: { id: true, username: true, displayName: true, avatar: true }
+//         }
+//       }
+//     }
+//   }
+// });
 
 
-    // Cache recent messages
-    await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(message));
-    await redis.ltrim(`channel:${channelId}:messages`, 0, 49); // Keep last 50 messages
+//     // Cache recent messages
+//     await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(message));
+//     await redis.ltrim(`channel:${channelId}:messages`, 0, 49); // Keep last 50 messages
 
-    res.status(201).json(message);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ error: error });
-    }
-    console.error('Send message error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+//     res.status(201).json(message);
+//   } catch (error) {
+//     if (error instanceof z.ZodError) {
+//       return res.status(400).json({ error: error });
+//     }
+//     console.error('Send message error:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
 
-app.get('/api/channels/:channelId/messages', authenticateToken, async (req: AuthRequest, res) => {
-  try {
-    const channelId = req.params.channelId as string;  // ✅
-    const { before, limit = '50' } = req.query;
+// app.get('/api/channels/:channelId/messages', authenticateToken, async (req: AuthRequest, res) => {
+//   try {
+//     const channelId = req.params.channelId as string;  // ✅
+//     const { before, limit = '50' } = req.query;
 
-    // Verify channel access (similar to above)
-    const channel = await prisma.channel.findUnique({
-      where: { id: channelId },
-      include: { server: true }
-    });
+//     // Verify channel access (similar to above)
+//     const channel = await prisma.channel.findUnique({
+//       where: { id: channelId },
+//       include: { server: true }
+//     });
 
-    if (!channel) {
-      return res.status(404).json({ error: 'Channel not found' });
-    }
+//     if (!channel) {
+//       return res.status(404).json({ error: 'Channel not found' });
+//     }
 
-    if (channel.serverId) {
-      const membership = await prisma.serverMember.findUnique({
-        where: {
-          userId_serverId: {
-            userId: req.user!.id,
-            serverId: channel.serverId
-          }
-        }
-      });
+//     if (channel.serverId) {
+//       const membership = await prisma.serverMember.findUnique({
+//         where: {
+//           userId_serverId: {
+//             userId: req.user!.id,
+//             serverId: channel.serverId
+//           }
+//         }
+//       });
 
-      if (!membership) {
-        return res.status(403).json({ error: 'Access denied' });
-      }
-    }
+//       if (!membership) {
+//         return res.status(403).json({ error: 'Access denied' });
+//       }
+//     }
 
-    // Try cache first for recent messages
-    if (!before) {
-      const cachedMessages = await redis.lrange(`channel:${channelId}:messages`, 0, parseInt(limit as string) - 1);
-      if (cachedMessages.length > 0) {
-        return res.json(cachedMessages.map(msg => JSON.parse(msg)));
-      }
-    }
+//     // Try cache first for recent messages
+//     if (!before) {
+//       const cachedMessages = await redis.lrange(`channel:${channelId}:messages`, 0, parseInt(limit as string) - 1);
+//       if (cachedMessages.length > 0) {
+//         return res.json(cachedMessages.map(msg => JSON.parse(msg)));
+//       }
+//     }
 
-    const messages = await prisma.message.findMany({
-      where: {
-        channelId,
-        ...(before && { createdAt: { lt: new Date(before as string) } })
-      },
-      include: {
-        author: {
-          select: { id: true, username: true, displayName: true, avatar: true }
-        },
-        attachments: true,
-        reactions: {
-          include: {
-            user: {
-              select: { id: true, username: true }
-            }
-          }
-        },
-        replyTo: {
-          include: {
-            author: {
-              select: { id: true, username: true, displayName: true, avatar: true }
-            }
-          }
-        }
-      },
-      orderBy: { createdAt: 'desc' },
-      take: parseInt(limit as string)
-    });
+//     const messages = await prisma.message.findMany({
+//       where: {
+//         channelId,
+//         ...(before && { createdAt: { lt: new Date(before as string) } })
+//       },
+//       include: {
+//         author: {
+//           select: { id: true, username: true, displayName: true, avatar: true }
+//         },
+//         attachments: true,
+//         reactions: {
+//           include: {
+//             user: {
+//               select: { id: true, username: true }
+//             }
+//           }
+//         },
+//         replyTo: {
+//           include: {
+//             author: {
+//               select: { id: true, username: true, displayName: true, avatar: true }
+//             }
+//           }
+//         }
+//       },
+//       orderBy: { createdAt: 'desc' },
+//       take: parseInt(limit as string)
+//     });
 
-    res.json(messages.reverse());
-  } catch (error) {
-    console.error('Get messages error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+//     res.json(messages.reverse());
+//   } catch (error) {
+//     console.error('Get messages error:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
 
 // Setup WebSocket
-setupWebSocket(server, prisma, redis);
+setupWebSocket(server, prisma, redis,app);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -1422,63 +1430,63 @@ app.get('/health', (req, res) => {
  * GET /api/channels/:channelId/messages
  * → List messages (with pagination: ?skip=&take=)
  */
-app.get("/api/channels/:channelId/messages", async (req, res) => {
-  try {
-    const { channelId } = req.params;
-    const skip = parseInt(req.query.skip as string) || 0;
-    const take = parseInt(req.query.take as string) || 20; // default 20 messages
+// app.get("/api/channels/:channelId/messages", async (req, res) => {
+//   try {
+//     const { channelId } = req.params;
+//     const skip = parseInt(req.query.skip as string) || 0;
+//     const take = parseInt(req.query.take as string) || 20; // default 20 messages
 
-    const messages = await prisma.message.findMany({
-      where: { channelId },
-      orderBy: { createdAt: "desc" },
-      skip,
-      take,
-      include: {
-        author: true,
-        attachments: true,
-        reactions: true,
-        embeds: true,
-      },
-    });
+//     const messages = await prisma.message.findMany({
+//       where: { channelId },
+//       orderBy: { createdAt: "desc" },
+//       skip,
+//       take,
+//       include: {
+//         author: true,
+//         attachments: true,
+//         reactions: true,
+//         embeds: true,
+//       },
+//     });
 
-    res.json(messages);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+//     res.json(messages);
+//   } catch (err: any) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
-/**
- * POST /api/channels/:channelId/messages
- * → Send message (text, attachments, replyTo)
- */
-app.post("/api/channels/:channelId/messages", async (req, res) => {
-  try {
-    const { channelId } = req.params;
-    const { authorId, content, replyToId, attachments } = req.body;
+// /**
+//  * POST /api/channels/:channelId/messages
+//  * → Send message (text, attachments, replyTo)
+//  */
+// app.post("/api/channels/:channelId/messages", async (req, res) => {
+//   try {
+//     const { channelId } = req.params;
+//     const { authorId, content, replyToId, attachments } = req.body;
 
-    const newMessage = await prisma.message.create({
-      data: {
-        content,
-        authorId,
-        channelId,
-        replyToId,
-        attachments: attachments?.map((a: any) => ({
-          create: {
-            filename: a.filename,
-            url: a.url,
-            size: a.size,
-            contentType: a.contentType,
-          },
-        })),
-      },
-      include: { attachments: true },
-    });
+//     const newMessage = await prisma.message.create({
+//       data: {
+//         content,
+//         authorId,
+//         channelId,
+//         replyToId,
+//         attachments: attachments?.map((a: any) => ({
+//           create: {
+//             filename: a.filename,
+//             url: a.url,
+//             size: a.size,
+//             contentType: a.contentType,
+//           },
+//         })),
+//       },
+//       include: { attachments: true },
+//     });
 
-    res.status(201).json(newMessage);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+//     res.status(201).json(newMessage);
+//   } catch (err: any) {
+//     res.status(500).json({ error: err.message });
+//   }
+// });
 
 /**
  * PATCH /api/messages/:messageId
