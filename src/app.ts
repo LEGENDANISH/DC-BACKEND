@@ -749,15 +749,15 @@ app.post("/api/channels/:channelId/messages", authenticateToken, async (req: Aut
       },
     });
 
-    // ✅ Cache recent messages
-    await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(newMessage));
-    await redis.ltrim(`channel:${channelId}:messages`, 0, 49);
+    // // ✅ Cache recent messages
+    // await redis.lpush(`channel:${channelId}:messages`, JSON.stringify(newMessage));
+    // await redis.ltrim(`channel:${channelId}:messages`, 0, 49);
 
-    // ✅ Emit directly to sockets in this process
-    const io = req.app.get("io");
-    if (io) {
-      io.to(`channel:${channelId}`).emit("message", newMessage);
-    }
+    // // ✅ Emit directly to sockets in this process
+    // const io = req.app.get("io");
+    // if (io) {
+    //   io.to(`channel:${channelId}`).emit("message", newMessage);
+    // }
 
     // ✅ Publish to Redis for other instances
     await redis.publish("new_message", JSON.stringify({ channelId, message: newMessage }));

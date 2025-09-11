@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Debug Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .panel { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; }
+        .status { padding: 10px; border-radius: 4px; margin-bottom: 10px; font-weight: bold; }
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .log { height: 300px; overflow-y: scroll; border: 1px solid #ddd; padding: 10px; background: #f8f9fa; font-family: monospace; font-size: 12px; }
+        .input-group { margin: 10px 0; }
+        input, textarea, button { width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; }
+        button { background: #007bff; color: white; cursor: pointer; }
+        button:disabled { background: #6c757d; cursor: not-allowed; }
+        .message-item { padding: 8px; margin: 5px 0; background: #e9ecef; border-radius: 4px; border-left: 3px solid #007bff; }
+        .error { color: #dc3545; }
+        .success { color: #28a745; }
+        .info { color: #17a2b8; }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Debug Test for Discord-like App</h1>
+    
+    <div class="container">
+        <div class="panel">
+            <h2>Connection & Auth</h2>
+            <div id="connectionStatus" class="status disconnected">Disconnected</div>
+            
+            <div class="input-group">
+                <label>Server URL:</label>
+                <input type="text" id="serverUrl" value="http://localhost:3001">
+            </div>
+            
+            <div class="input-group">
+                <label>Email:</label>
+                <input type="email" id="email" value="test@example.com">
+            </div>
+            
+            <div class="input-group">
+                <label>Password:</label>
+                <input type="password" id="password" value="password123">
+            </div>
+            
+            <button id="loginBtn">1. Login & Get Token</button>
+            <button id="connectWsBtn" disabled>2. Connect WebSocket</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+            
+            <div class="input-group">
+                <label>Manual Token (if you have one):</label>
+                <textarea id="manualToken" rows="3" placeholder="Paste JWT token here"></textarea>
+                <button id="useManualTokenBtn">Use Manual Token</button>
+            </div>
+        </div>
+        
+        <div class="panel">
+            <h2>Channel & Messages</h2>
+            
+            <div class="input-group">
+                <label>Channel ID:</label>
+                <input type="text" id="channelId" placeholder="Enter channel ID">
+            </div>
+            
+            <button id="joinChannelBtn" disabled>3. Join Channel</button>
+            <button id="leaveChannelBtn" disabled>Leave Channel</button>
+            
+            <div class="input-group">
+                <label>Message Content:</label>
+                <textarea id="messageContent" rows="3" placeholder="Type your test message..."></textarea>
+            </div>
+            
+            <button id="sendWsBtn" disabled>Send via WebSocket</button>
+            <button id="sendRestBtn" disabled>Send via REST API</button>
+            
+            <h3>Live Messages</h3>
+            <div id="messagesLog" class="log"></div>
+            <button id="clearMsgsBtn">Clear Messages</button>
+        </div>
+    </div>
+    
+    <div class="panel" style="margin-top: 20px;">
+        <h2>Debug Logs & Tests</h2>
+        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+            <button id="testRestAPIBtn" disabled>Test REST Endpoints</button>
+            <button id="testRedisBtn" disabled>Test Redis Connection</button>
+            <button id="clearLogBtn">Clear Debug Log</button>
+        </div>
+        <div id="debugLog" class="log"></div>
+    </div>
+
+    <script>
+        let socket = null;
+        let authToken = null;
+        let currentUser = null;
+        let currentChannelId = null;
+        let messageCount = 0;
+
+        // DOM elements
+        const elements = {
+            connectionStatus: document.getElementById('connectionStatus'),
+            serverUrl: document.getElementById('serverUrl'),
+            email: document.getElementById('email'),
+            password: document.getElementById('password'),
+            manualToken: document.getElementById('manualToken'),
+            channelId: document.getElementById('channelId'),
+            messageContent: document.getElementById('messageContent'),
+            messagesLog: document.getElementById('messagesLog'),
+            debugLog: document.getElementById('debugLog'),
+            
+            loginBtn: document.getElementById('loginBtn'),
+            connectWsBtn: document.getElementById('connectWsBtn'),
+            disconnectBtn: document.getElementById('disconnectBtn'),
+            useManualTokenBtn: document.getElementById('useManualTokenBtn'),
+            joinChannelBtn: document.getElementById('joinChannelBtn'),
+            leaveChannelBtn: document.getElementById('leaveChannelBtn'),
+            sendWsBtn: document.getElementById('sendWsBtn'),
+            sendRestBtn: document.getElementById('sendRestBtn'),
+            testRestAPIBtn: document.getElementById('testRestAPIBtn'),
+            testRedisBtn: document.getElementById('testRedisBtn'),
+            clearMsgsBtn: document.getElementById('clearMsgsBtn'),
+            clearLogBtn: document.getElementById('clearLogBtn')
+        };
+
+        // Logging functions
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const entry = `[${timestamp}] ${message}`;
+            console.log(entry);
+            
+            const div = document.createElement('div');
+            div.className = type;
+            div.textContent = entry;
+            elements.debugLog.appendChild(div);
+            elements.debugLog.scrollTop = elements.debugLog.scrollHeight;
+        }
+
+        function displayMessage(message, source) {
+            messageCount++;
+            const div = document.createElement('div');
+            div.className = 'message-item';
+            div.innerHTML = `
+                <div><strong>#${messageCount} [${source}]</strong> ${message.author?.username || 'Unknown'}: ${message.content || '[No content]'}</div>
+                <div style="font-size: 10px; color: #666;">ID: ${message.id} | Channel: ${message.channelId} | Time: ${new Date(message.createdAt || Date.now()).toLocaleTimeString()}</div>
+            `;
+            elements.messagesLog.appendChild(div);
+            elements.messagesLog.scrollTop = elements.messagesLog.scrollHeight;
+            
+            log(`📨 Message via ${source}: "${message.content}"`, 'success');
+        }
+
+        function updateConnectionStatus(connected, details = '') {
+            elements.connectionStatus.textContent = connected ? `✅ Connected ${details}` : `❌ Disconnected ${details}`;
+            elements.connectionStatus.className = `status ${connected ? 'connected' : 'disconnected'}`;
+            
+            // Update button states
+            elements.connectWsBtn.disabled = connected || !authToken;
+            elements.disconnectBtn.disabled = !connected;
+            elements.joinChannelBtn.disabled = !connected;
+            elements.leaveChannelBtn.disabled = !connected || !currentChannelId;
+            elements.sendWsBtn.disabled = !connected || !currentChannelId;
+            elements.sendRestBtn.disabled = !authToken;
+            elements.testRestAPIBtn.disabled = !authToken;
+        }
+
+        // 1. Login function
+        async function login() {
+            try {
+                log('🔐 Attempting login...', 'info');
+                
+                const response = await fetch(`${elements.serverUrl.value}/api/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        email: elements.email.value,
+                        password: elements.password.value
+                    })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    authToken = data.token;
+                    currentUser = data.user;
+                    log(`✅ Login successful! User: ${currentUser.username}`, 'success');
+                    log(`🔑 Token: ${authToken.substring(0, 30)}...`, 'info');
+                    elements.connectWsBtn.disabled = false;
+                    elements.testRestAPIBtn.disabled = false;
+                    elements.sendRestBtn.disabled = false;
+                } else {
+                    log(`❌ Login failed: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                log(`❌ Login error: ${error.message}`, 'error');
+            }
+        }
+
+        // 2. WebSocket connection
+        function connectWebSocket() {
+            try {
+                log('🔌 Connecting to WebSocket...', 'info');
+                
+                socket = io(elements.serverUrl.value, {
+                    auth: { token: authToken },
+                    transports: ['websocket', 'polling'],
+                    forceNew: true
+                });
+
+                socket.on('connect', () => {
+                    log('✅ WebSocket connected!', 'success');
+                    updateConnectionStatus(true, `(ID: ${socket.id})`);
+                });
+
+                socket.on('disconnect', (reason) => {
+                    log(`❌ WebSocket disconnected: ${reason}`, 'error');
+                    updateConnectionStatus(false, `(${reason})`);
+                });
+
+                socket.on('connect_error', (error) => {
+                    log(`❌ Connection error: ${error.message}`, 'error');
+                    updateConnectionStatus(false, '(Error)');
+                });
+
+                socket.on('error', (error) => {
+                    log(`❌ Socket error: ${error.message}`, 'error');
+                });
+
+                // Listen for messages
+                socket.on('message', (message) => {
+                    log(`📥 WebSocket message received: ${JSON.stringify(message)}`, 'info');
+                    displayMessage(message, 'WebSocket');
+                });
+
+                socket.on('ready', (data) => {
+                    log(`🚀 Ready event received: ${JSON.stringify(data)}`, 'success');
+                });
+
+                socket.on('channel_joined', (data) => {
+                    log(`📂 Channel joined: ${JSON.stringify(data)}`, 'success');
+                    currentChannelId = data.channelId;
+                    elements.leaveChannelBtn.disabled = false;
+                    elements.sendWsBtn.disabled = false;
+                });
+
+                socket.on('channel_left', (data) => {
+                    log(`📂 Channel left: ${JSON.stringify(data)}`, 'info');
+                    currentChannelId = null;
+                    elements.leaveChannelBtn.disabled = true;
+                    elements.sendWsBtn.disabled = true;
+                });
+
+                // Listen for typing events
+                socket.on('typing_start', (data) => {
+                    log(`⌨️ User typing: ${data.username} in ${data.channelId}`, 'info');
+                });
+
+                socket.on('typing_stop', (data) => {
+                    log(`⌨️ User stopped typing: ${data.userId} in ${data.channelId}`, 'info');
+                });
+
+            } catch (error) {
+                log(`❌ WebSocket setup error: ${error.message}`, 'error');
+            }
+        }
+
+        // 3. Join channel
+        function joinChannel() {
+            const channelId = elements.channelId.value.trim();
+            if (!channelId) {
+                log('❌ Please enter a channel ID', 'error');
+                return;
+            }
+
+            log(`📂 Joining channel: ${channelId}`, 'info');
+            socket.emit('join_channel', channelId);
+        }
+
+        // Leave channel
+        function leaveChannel() {
+            if (!currentChannelId) return;
+            
+            log(`📂 Leaving channel: ${currentChannelId}`, 'info');
+            socket.emit('leave_channel', currentChannelId);
+        }
+
+        // Send message via WebSocket
+        function sendWebSocketMessage() {
+            const content = elements.messageContent.value.trim();
+            if (!content) {
+                log('❌ Please enter message content', 'error');
+                return;
+            }
+
+            const messageData = {
+                channelId: currentChannelId,
+                content: content
+            };
+
+            log(`📤 Sending WebSocket message: ${JSON.stringify(messageData)}`, 'info');
+            socket.emit('message', messageData);
+            elements.messageContent.value = '';
+        }
+
+        // Send message via REST API
+        async function sendRestMessage() {
+            const content = elements.messageContent.value.trim();
+            const channelId = elements.channelId.value.trim();
+            
+            if (!content || !channelId) {
+                log('❌ Please enter both message content and channel ID', 'error');
+                return;
+            }
+
+            try {
+                log(`📤 Sending REST message to channel ${channelId}`, 'info');
+                
+                const response = await fetch(`${elements.serverUrl.value}/api/channels/${channelId}/messages`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    },
+                    body: JSON.stringify({ content })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    log(`✅ REST message sent successfully`, 'success');
+                    displayMessage(data, 'REST API');
+                    elements.messageContent.value = '';
+                } else {
+                    log(`❌ REST message failed: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                log(`❌ REST message error: ${error.message}`, 'error');
+            }
+        }
+
+        // Test REST API endpoints
+        async function testRestAPI() {
+            log('🧪 Testing REST API endpoints...', 'info');
+
+            // Test user info
+            try {
+                const userResponse = await fetch(`${elements.serverUrl.value}/api/users/me`, {
+                    headers: { 'Authorization': `Bearer ${authToken}` }
+                });
+                const userData = await userResponse.json();
+                log(`👤 User info: ${JSON.stringify(userData)}`, 'info');
+            } catch (error) {
+                log(`❌ User info test failed: ${error.message}`, 'error');
+            }
+
+            // Test servers
+            try {
+                const serversResponse = await fetch(`${elements.serverUrl.value}/api/servers`, {
+                    headers: { 'Authorization': `Bearer ${authToken}` }
+                });
+                const serversData = await serversResponse.json();
+                log(`🏠 Servers: ${JSON.stringify(serversData)}`, 'info');
+            } catch (error) {
+                log(`❌ Servers test failed: ${error.message}`, 'error');
+            }
+
+            // Test channel messages if channel ID is provided
+            const channelId = elements.channelId.value.trim();
+            if (channelId) {
+                try {
+                    const messagesResponse = await fetch(`${elements.serverUrl.value}/api/channels/${channelId}/messages`, {
+                        headers: { 'Authorization': `Bearer ${authToken}` }
+                    });
+                    const messagesData = await messagesResponse.json();
+                    log(`💬 Channel messages: ${JSON.stringify(messagesData)}`, 'info');
+                } catch (error) {
+                    log(`❌ Messages test failed: ${error.message}`, 'error');
+                }
+            }
+        }
+
+        // Event listeners
+        elements.loginBtn.addEventListener('click', login);
+        elements.connectWsBtn.addEventListener('click', connectWebSocket);
+        elements.disconnectBtn.addEventListener('click', () => {
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+        });
+        
+        elements.useManualTokenBtn.addEventListener('click', () => {
+            const token = elements.manualToken.value.trim();
+            if (token) {
+                authToken = token;
+                log('🔑 Manual token set', 'info');
+                elements.connectWsBtn.disabled = false;
+                elements.testRestAPIBtn.disabled = false;
+                elements.sendRestBtn.disabled = false;
+            }
+        });
+
+        elements.joinChannelBtn.addEventListener('click', joinChannel);
+        elements.leaveChannelBtn.addEventListener('click', leaveChannel);
+        elements.sendWsBtn.addEventListener('click', sendWebSocketMessage);
+        elements.sendRestBtn.addEventListener('click', sendRestMessage);
+        elements.testRestAPIBtn.addEventListener('click', testRestAPI);
+        
+        elements.clearMsgsBtn.addEventListener('click', () => {
+            elements.messagesLog.innerHTML = '';
+            messageCount = 0;
+        });
+        
+        elements.clearLogBtn.addEventListener('click', () => {
+            elements.debugLog.innerHTML = '';
+        });
+
+        // Initialize
+        updateConnectionStatus(false);
+        log('🚀 WebSocket Debug Test initialized', 'info');
+        log('📋 Instructions: 1) Login, 2) Connect WebSocket, 3) Join Channel, 4) Send messages', 'info');
+
+    </script>
+</body>
+</html>

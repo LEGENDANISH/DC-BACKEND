@@ -38,7 +38,7 @@ interface VoiceStateData {
 export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: Redis,app :Express.Application) {
   const io = new SocketIOServer(server, {
     cors: {
-    origin: ['http://localhost:3000', 'http://127.0.0.1:5500','http://localhost:5173'], // 👈 add both origins
+    origin: ['http://localhost:3000', 'http://127.0.0.1:5500','http://localhost:5173',"http://127.0.0.1:5500'"], // 👈 add both origins
       methods: ['GET', 'POST'],
       credentials: true
     },
@@ -761,15 +761,15 @@ export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: 
 subscriber.subscribe('new_message', 'message_update', 'message_delete', 'user_status_update', 'server_update');
 
 subscriber.on('message', (channel, message) => {
- console.log(`Debug - Redis subscriber received message on channel: ${channel}`); // Add this log
-  const data = JSON.parse(message);
-  
-  switch (channel) {
-    case 'new_message':
-console.log(`Debug - Handling new_message from Redis for channel ID: ${data.channelId}`); // Add this log
-      io.to(`channel:${data.channelId}`).emit('message', data.message);
-      console.log(`Debug - Message emitted to room channel:${data.channelId} via Redis handler`); // Add this log
-            break;
+    console.log(`Debug - Redis subscriber received message on channel: ${channel}`);
+    const data = JSON.parse(message);
+    
+    switch (channel) {
+      case 'new_message':
+        console.log(`Debug - Handling new_message from Redis for channel ID: ${data.channelId}`);
+        io.to(`channel:${data.channelId}`).emit('message', data.message);
+        console.log(`Debug - Message emitted to room channel:${data.channelId} via Redis handler`);
+        break;
 
     case 'message_update':
       io.to(`channel:${data.channelId}`).emit('message_update', data.message);
