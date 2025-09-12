@@ -789,6 +789,460 @@ subscriber.on('message', (channel, message) => {
   }
 });
 
+
+
+
+
+io.on('connection', async (socket: AuthenticatedSocket) => {
+  // ... existing connection code ...
+
+  // Join friends room for notifications
+  socket.join(`user:${socket.userId}`);
+
+  // Send initial friend data
+  const friendsData = await getFriendsData(socket.userId!);
+  socket.emit('friends_initial_data', friendsData);
+
+  // Handle friend request events
+  socket.on('send_friend_request', async (data: { username: string }) => {
+    try {
+      const { username } = data;
+
+      const targetUser = await prisma.user.findUnique({
+        where: { username },
+        select: { id: true, username: true, displayName: true, avatar: true }
+      });
+
+      if (!targetUser) {
+        socket.emit('error', { message: 'User not found' });
+        return;
+      }
+
+      if (targetUser.id === socket.userId) {
+        socket.emit('error', { message: 'Cannot send friend request to yourself' });
+        return;
+      }
+
+      // Check existing friendship
+      const existingFriendship = await prisma.friendship.findFirst({
+        where: {
+          OR: [
+            { senderId: socket.userId!, receiverId: targetUser.id },
+            { senderId: targetUser.id, receiverId: socket.userId! }
+          ]
+        }
+      });
+
+      if (existingFriendship) {
+        let message = 'Friend request already exists';
+        if (existingFriendship.status === 'ACCEPTED') {
+          message = 'Already friends';
+        } else if (existingFriendship.status === 'BLOCKED') {
+          message = 'Cannot send friend request';
+        }
+        socket.emit('error', { message });
+        return;
+      }
+
+      const friendship = await prisma.friendship.create({
+        data: {
+          senderId: socket.userId!,
+          receiverId: targetUser.id,
+          status: 'PENDING'
+        }
+      });
+
+      // Notify target user
+      io.to(`user:${targetUser.id}`).emit('friend_request_received', {
+        id: friendship.id,
+        sender: {
+          id: socket.userId,
+          username: socket.user?.username,
+          displayName: socket.user?.displayName,
+          avatar: socket.user?.avatar
+        },
+        createdAt: friendship.createdAt
+      });
+
+      socket.emit('friend_request_sent', {
+        id: friendship.id,
+        receiver: targetUser
+      });
+
+    } catch (error) {
+      console.error('Send friend request error:', error);
+      socket.emit('error', { message: 'Failed to send friend request' });
+    }
+  });
+
+  socket.on('respond_friend_request', async (data: { requestId: string; accept: boolean }) => {
+    try {
+      const { requestId, accept } = data;
+
+      const friendship = await prisma.friendship.findUnique({
+        where: { id: requestId },
+        include: {
+          sender: {
+            select: { id: true, username: true, displayName: true, avatar: true }
+          }
+        }
+      });
+
+      if (!friendship || friendship.receiverId !== socket.userId) {
+        socket.emit('error', { message: 'Invalid friend request' });
+        return;
+      }
+
+      if (accept) {
+        await prisma.friendship.update({
+          where: { id: requestId },
+          data: { status: 'ACCEPTED' }
+        });
+
+        const friendData = {
+          id: friendship.sender.id,
+          username: friendship.sender.username,
+          displayName: friendship.sender.displayName,
+          avatar: friendship.sender.avatar,
+          status: 'OFFLINE', // Will be updated by presence system
+          friendsSince: friendship.createdAt
+        };
+
+        // Notify both users
+        io.to(`user:${friendship.senderId}`).emit('friend_added', {
+          friend: {
+            id: socket.userId,
+            username: socket.user?.username,
+            displayName: socket.user?.displayName,
+            avatar: socket.user?.avatar,
+            status: socket.user?.status,
+            friendsSince: friendship.createdAt
+          }
+        });
+
+        socket.emit('friend_added', { friend: friendData });
+
+      } else {
+        await prisma.friendship.delete({ where: { id: requestId } });
+
+        // Notify sender of decline
+        io.to(`user:${friendship.senderId}`).emit('friend_request_declined', {
+          userId: socket.userId
+        });
+      }
+
+      // Remove from pending requests
+      socket.emit('friend_request_removed', { requestId });
+
+    } catch (error) {
+      console.error('Respond to friend request error:', error);
+      socket.emit('error', { message: 'Failed to respond to friend request' });
+    }
+  });
+
+  // Handle direct messages
+  socket.on('send_direct_message', async (data: { targetId: string; content: string; attachments?: any[] }) => {
+    try {
+      const { targetId, content, attachments } = data;
+
+      if (targetId === socket.userId) {
+        socket.emit('error', { message: 'Cannot send message to yourself' });
+        return;
+      }
+
+      if (!content && (!attachments || attachments.length === 0)) {
+        socket.emit('error', { message: 'Message content or attachments required' });
+        return;
+      }
+
+      // Check if users can DM each other
+      const canDM = await checkCanDMWebSocket(socket.userId!, targetId);
+      if (!canDM) {
+        socket.emit('error', { message: 'Cannot send message to this user' });
+        return;
+      }
+const message = await prisma.directMessage.create({
+  data: {
+    content,
+    authorId: socket.userId!,
+    targetId,
+    ...(attachments && attachments.length > 0
+      ? {
+          attachments: {
+            create: attachments.map((a: any) => ({
+              url: a.url,
+              filename: a.filename,
+              size: a.size,
+              contentType: a.contentType,
+            })),
+          },
+        }
+      : {}),
+  },
+  include: {
+    author: {
+      select: { id: true, username: true, displayName: true, avatar: true }
+    },
+    attachments: true
+  }
+});
+
+
+      // Send to both users
+      io.to(`user:${targetId}`).emit('direct_message_received', message);
+      socket.emit('direct_message_sent', message);
+
+    } catch (error) {
+      console.error('Send direct message error:', error);
+      socket.emit('error', { message: 'Failed to send direct message' });
+    }
+  });
+
+  // Handle typing in DMs
+  socket.on('dm_typing_start', (data: { targetId: string }) => {
+    io.to(`user:${data.targetId}`).emit('dm_typing_start', {
+      userId: socket.userId,
+      username: socket.user?.username
+    });
+  });
+
+  socket.on('dm_typing_stop', (data: { targetId: string }) => {
+    io.to(`user:${data.targetId}`).emit('dm_typing_stop', {
+      userId: socket.userId
+    });
+  });
+
+  // Handle friend removal
+  socket.on('remove_friend', async (data: { friendId: string }) => {
+    try {
+      const { friendId } = data;
+
+      const friendship = await prisma.friendship.findFirst({
+        where: {
+          OR: [
+            { senderId: socket.userId!, receiverId: friendId },
+            { senderId: friendId, receiverId: socket.userId! }
+          ],
+          status: 'ACCEPTED'
+        }
+      });
+
+      if (!friendship) {
+        socket.emit('error', { message: 'Friendship not found' });
+        return;
+      }
+
+      await prisma.friendship.delete({ where: { id: friendship.id } });
+
+      // Notify both users
+      io.to(`user:${friendId}`).emit('friend_removed', {
+        userId: socket.userId
+      });
+
+      socket.emit('friend_removed', {
+        userId: friendId
+      });
+
+    } catch (error) {
+      console.error('Remove friend error:', error);
+      socket.emit('error', { message: 'Failed to remove friend' });
+    }
+  });
+
+  // Update existing status update handler to notify friends
+  socket.on('status_update', async (status: 'ONLINE' | 'IDLE' | 'DO_NOT_DISTURB' | 'OFFLINE') => {
+    try {
+      await prisma.user.update({
+        where: { id: socket.userId! },
+        data: { status }
+      });
+
+      // Update cache
+      if (socket.user) {
+        socket.user.status = status;
+        await redis.setex(`user:${socket.userId}`, 300, JSON.stringify(socket.user));
+      }
+
+      // Broadcast to friends
+      const friends = await prisma.friendship.findMany({
+        where: {
+          OR: [
+            { senderId: socket.userId!, status: 'ACCEPTED' },
+            { receiverId: socket.userId!, status: 'ACCEPTED' }
+          ]
+        }
+      });
+
+      for (const friendship of friends) {
+        const friendId = friendship.senderId === socket.userId ? friendship.receiverId : friendship.senderId;
+        io.to(`user:${friendId}`).emit('friend_status_update', {
+          userId: socket.userId,
+          status,
+          username: socket.user?.username
+        });
+      }
+
+      // Also broadcast to servers (existing code)
+      const userServers = await prisma.serverMember.findMany({
+        where: { userId: socket.userId! },
+        include: { server: true }
+      });
+
+      for (const membership of userServers) {
+        socket.to(`server:${membership.serverId}`).emit('user_status_update', {
+          userId: socket.userId,
+          status,
+          username: socket.user?.username
+        });
+      }
+
+    } catch (error) {
+      console.error('Status update error:', error);
+      socket.emit('error', { message: 'Failed to update status' });
+    }
+  });
+});
+
+// Add Redis subscriber for friend-related events
+subscriber.subscribe('friend_request', 'direct_message');
+
+subscriber.on('message', (channel, message) => {
+  const data = JSON.parse(message);
+  
+  switch (channel) {
+    case 'friend_request':
+      io.to(`user:${data.receiverId}`).emit(data.type, data.data);
+      break;
+    
+    case 'direct_message':
+      switch (data.type) {
+        case 'new_dm':
+          io.to(`user:${data.targetId}`).emit('direct_message_received', data.message);
+          break;
+        case 'dm_deleted':
+          io.to(`user:${data.targetId}`).emit('direct_message_deleted', {
+            messageId: data.messageId
+          });
+          break;
+      }
+      break;
+  }
+});
+
+// Helper function for WebSocket DM permission check
+async function checkCanDMWebSocket(userId1: string, userId2: string): Promise<boolean> {
+  // Check if users are friends
+  const friendship = await prisma.friendship.findFirst({
+    where: {
+      OR: [
+        { senderId: userId1, receiverId: userId2, status: 'ACCEPTED' },
+        { senderId: userId2, receiverId: userId1, status: 'ACCEPTED' }
+      ]
+    }
+  });
+
+  if (friendship) return true;
+
+  // Check if they have previous messages
+  const existingMessages = await prisma.directMessage.findFirst({
+    where: {
+      OR: [
+        { authorId: userId1, targetId: userId2 },
+        { authorId: userId2, targetId: userId1 }
+      ]
+    }
+  });
+
+  if (existingMessages) return true;
+
+  // Check if they're in the same server
+  const commonServer = await prisma.serverMember.findFirst({
+    where: {
+      userId: userId1,
+      server: {
+        members: {
+          some: { userId: userId2 }
+        }
+      }
+    }
+  });
+
+  return !!commonServer;
+}
+
+// Helper function to get initial friends data
+async function getFriendsData(userId: string) {
+  const [friends, pendingRequests, sentRequests] = await Promise.all([
+    // Get accepted friends
+    prisma.friendship.findMany({
+      where: {
+        OR: [
+          { senderId: userId, status: 'ACCEPTED' },
+          { receiverId: userId, status: 'ACCEPTED' }
+        ]
+      },
+      include: {
+        sender: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        },
+        receiver: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        }
+      }
+    }),
+    
+    // Get pending friend requests (incoming)
+    prisma.friendship.findMany({
+      where: {
+        receiverId: userId,
+        status: 'PENDING'
+      },
+      include: {
+        sender: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        }
+      }
+    }),
+    
+    // Get sent friend requests (outgoing)
+    prisma.friendship.findMany({
+      where: {
+        senderId: userId,
+        status: 'PENDING'
+      },
+      include: {
+        receiver: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        }
+      }
+    })
+  ]);
+
+  return {
+    friends: friends.map(f => ({
+      ...(f.senderId === userId ? f.receiver : f.sender),
+      friendsSince: f.createdAt
+    })),
+    pendingRequests: pendingRequests.map(r => ({
+      id: r.id,
+      sender: r.sender,
+      createdAt: r.createdAt
+    })),
+    sentRequests: sentRequests.map(r => ({
+      id: r.id,
+      receiver: r.receiver,
+      createdAt: r.createdAt
+    }))
+  };
+}
+
+
+
+
+
+
+
+
   // Cleanup typing indicators every 30 seconds
   setInterval(async () => {
     const keys = await redis.keys('typing:*');

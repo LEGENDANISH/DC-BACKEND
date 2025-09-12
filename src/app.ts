@@ -40,7 +40,10 @@ interface AuthRequest extends express.Request {
     id: string;
     username: string;
     email: string;
-    password?: string;
+    password?: string; 
+     displayName?: string | null;
+    avatar?: string | null;
+    status?: string | null;
   };
 }
 
@@ -1417,6 +1420,701 @@ app.delete("/channels/:channelId", async (req, res) => {
 //     res.status(500).json({ error: 'Internal server error' });
 //   }
 // });
+
+
+// Add these routes to your main server file
+
+// Send friend request by username or user ID
+app.post('/api/friends/request', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { username, userId } = req.body;
+    
+    if (!username && !userId) {
+      return res.status(400).json({ error: 'Username or userId required' });
+    }
+
+    // Find target user
+    const targetUser = await prisma.user.findFirst({
+      where: username ? { username } : { id: userId },
+      select: { id: true, username: true, displayName: true, avatar: true }
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (targetUser.id === req.user!.id) {
+      return res.status(400).json({ error: 'Cannot send friend request to yourself' });
+    }
+
+    // Check if friendship already exists
+    const existingFriendship = await prisma.friendship.findFirst({
+      where: {
+        OR: [
+          { senderId: req.user!.id, receiverId: targetUser.id },
+          { senderId: targetUser.id, receiverId: req.user!.id }
+        ]
+      }
+    });
+
+    if (existingFriendship) {
+      if (existingFriendship.status === 'ACCEPTED') {
+        return res.status(400).json({ error: 'Already friends' });
+      } else if (existingFriendship.status === 'PENDING') {
+        return res.status(400).json({ error: 'Friend request already sent' });
+      } else if (existingFriendship.status === 'BLOCKED') {
+        return res.status(400).json({ error: 'Cannot send friend request' });
+      }
+    }
+
+    // Create friend request
+    const friendship = await prisma.friendship.create({
+      data: {
+        senderId: req.user!.id,
+        receiverId: targetUser.id,
+        status: 'PENDING'
+      }
+    });
+
+    // Notify target user via WebSocket
+    await redis.publish('friend_request', JSON.stringify({
+      type: 'friend_request_received',
+      receiverId: targetUser.id,
+      data: {
+        id: friendship.id,
+        sender: {
+          id: req.user!.id,
+          username: req.user!.username,
+          displayName: req.user!.displayName,
+          avatar: req.user!.avatar
+        }
+      }
+    }));
+
+    res.json({ message: 'Friend request sent', friendship });
+  } catch (error) {
+    console.error('Send friend request error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get pending friend requests (incoming)
+app.get('/api/friends/requests', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const requests = await prisma.friendship.findMany({
+      where: {
+        receiverId: req.user!.id,
+        status: 'PENDING'
+      },
+      include: {
+        sender: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json(requests);
+  } catch (error) {
+    console.error('Get friend requests error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get sent friend requests (outgoing)
+app.get('/api/friends/requests/sent', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const requests = await prisma.friendship.findMany({
+      where: {
+        senderId: req.user!.id,
+        status: 'PENDING'
+      },
+      include: {
+        receiver: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    res.json(requests);
+  } catch (error) {
+    console.error('Get sent requests error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Accept/decline friend request
+app.patch('/api/friends/requests/:requestId', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+const requestId = req.params.requestId as string;
+    const { action } = req.body; // 'accept' or 'decline'
+
+    if (!['accept', 'decline'].includes(action)) {
+      return res.status(400).json({ error: 'Action must be accept or decline' });
+    }
+
+    const friendship = await prisma.friendship.findUnique({
+      where: { id: requestId },
+      include: {
+        sender: { select: { id: true, username: true, displayName: true, avatar: true } }
+      }
+    });
+
+    if (!friendship) {
+      return res.status(404).json({ error: 'Friend request not found' });
+    }
+
+    if (friendship.receiverId !== req.user!.id) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    if (action === 'accept') {
+      const updatedFriendship = await prisma.friendship.update({
+        where: { id: requestId },
+        data: { status: 'ACCEPTED' }
+      });
+
+      // Notify sender
+      await redis.publish('friend_request', JSON.stringify({
+        type: 'friend_request_accepted',
+        receiverId: friendship.senderId,
+        data: {
+          friend: {
+            id: req.user!.id,
+            username: req.user!.username,
+            displayName: req.user!.displayName,
+            avatar: req.user!.avatar
+          }
+        }
+      }));
+
+      res.json({ message: 'Friend request accepted', friendship: updatedFriendship });
+    } else {
+      await prisma.friendship.delete({ where: { id: requestId } });
+
+      // Notify sender of decline
+      await redis.publish('friend_request', JSON.stringify({
+        type: 'friend_request_declined',
+        receiverId: friendship.senderId,
+        data: { userId: req.user!.id }
+      }));
+
+      res.json({ message: 'Friend request declined' });
+    }
+  } catch (error) {
+    console.error('Handle friend request error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get friends list
+app.get('/api/friends', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { status } = req.query; // 'online', 'offline', 'all'
+    
+    const friendships = await prisma.friendship.findMany({
+      where: {
+        OR: [
+          { senderId: req.user!.id, status: 'ACCEPTED' },
+          { receiverId: req.user!.id, status: 'ACCEPTED' }
+        ]
+      },
+      include: {
+        sender: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        },
+        receiver: {
+          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+        }
+      }
+    });
+
+    // Map to friend objects
+    const friends = friendships.map(friendship => {
+      const friend = friendship.senderId === req.user!.id ? friendship.receiver : friendship.sender;
+      return {
+        ...friend,
+        friendshipId: friendship.id,
+        friendsSince: friendship.createdAt
+      };
+    });
+
+    // Filter by status if specified
+    let filteredFriends = friends;
+    if (status === 'online') {
+      filteredFriends = friends.filter(f => f.status === 'ONLINE');
+    } else if (status === 'offline') {
+      filteredFriends = friends.filter(f => f.status !== 'ONLINE');
+    }
+
+    res.json(filteredFriends);
+  } catch (error) {
+    console.error('Get friends error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove friend
+app.delete('/api/friends/:friendId', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const friendId = req.params.friendId as string;
+    const userId = req.user!.id as string;
+
+    const friendship = await prisma.friendship.findFirst({
+      where: {
+        OR: [
+          { senderId: userId, receiverId: friendId },
+          { senderId: friendId, receiverId: userId }
+        ],
+        status: 'ACCEPTED'
+      }
+    });
+
+    if (!friendship) {
+      return res.status(404).json({ error: 'Friendship not found' });
+    }
+
+    await prisma.friendship.delete({ where: { id: friendship.id } });
+
+    // Notify the other user
+    await redis.publish('friend_request', JSON.stringify({
+      type: 'friend_removed',
+      receiverId: friendId,
+      data: { userId }
+    }));
+
+    res.json({ message: 'Friend removed' });
+  } catch (error) {
+    console.error('Remove friend error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// Search users (for adding friends)
+app.get('/api/users/search', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { q } = req.query;
+    
+    if (!q || typeof q !== 'string' || q.trim().length < 2) {
+      return res.status(400).json({ error: 'Query must be at least 2 characters' });
+    }
+
+    const users = await prisma.user.findMany({
+      where: {
+        AND: [
+          { id: { not: req.user!.id } }, // Exclude current user
+          {
+            OR: [
+              { username: { contains: q.trim(), mode: 'insensitive' } },
+              { displayName: { contains: q.trim(), mode: 'insensitive' } }
+            ]
+          }
+        ]
+      },
+      select: {
+        id: true,
+        username: true,
+        displayName: true,
+        avatar: true,
+        status: true
+      },
+      take: 10
+    });
+
+    // Check friendship status for each user
+    const usersWithFriendshipStatus = await Promise.all(
+      users.map(async (user) => {
+        const friendship = await prisma.friendship.findFirst({
+          where: {
+            OR: [
+              { senderId: req.user!.id, receiverId: user.id },
+              { senderId: user.id, receiverId: req.user!.id }
+            ]
+          }
+        });
+
+        return {
+          ...user,
+          friendshipStatus: friendship?.status || 'NONE',
+          canSendRequest: !friendship || friendship.status === 'BLOCKED'
+        };
+      })
+    );
+
+    res.json(usersWithFriendshipStatus);
+  } catch (error) {
+    console.error('Search users error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Block/unblock user
+app.post('/api/friends/block/:userId', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.params.userId as string;
+    const currentUserId = req.user!.id as string;
+    const { action } = req.body; // 'block' or 'unblock'
+
+    if (!['block', 'unblock'].includes(action)) {
+      return res.status(400).json({ error: 'Action must be block or unblock' });
+    }
+
+    if (userId === currentUserId) {
+      return res.status(400).json({ error: 'Cannot block yourself' });
+    }
+
+    const existingFriendship = await prisma.friendship.findFirst({
+      where: {
+        OR: [
+          { senderId: currentUserId, receiverId: userId },
+          { senderId: userId, receiverId: currentUserId }
+        ]
+      }
+    });
+
+    if (action === 'block') {
+      if (existingFriendship) {
+        await prisma.friendship.update({
+          where: { id: existingFriendship.id },
+          data: { status: 'BLOCKED' }
+        });
+      } else {
+        await prisma.friendship.create({
+          data: {
+            senderId: currentUserId,
+            receiverId: userId,
+            status: 'BLOCKED'
+          }
+        });
+      }
+      res.json({ message: 'User blocked' });
+    } else {
+      if (existingFriendship?.status === 'BLOCKED') {
+        await prisma.friendship.delete({ where: { id: existingFriendship.id } });
+      }
+      res.json({ message: 'User unblocked' });
+    }
+  } catch (error) {
+    console.error('Block/unblock user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+
+
+// Add these DM routes to your main server file
+
+// Get all DM conversations for the user
+app.get('/api/dms', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    // Get all DM conversations where user is involved
+    const conversations = await prisma.$queryRaw`
+      SELECT DISTINCT
+        CASE 
+          WHEN dm."authorId" = ${req.user!.id} THEN dm."targetId"
+          ELSE dm."authorId"
+        END as "otherUserId",
+        MAX(dm."createdAt") as "lastMessageAt",
+        COUNT(dm.id) as "messageCount"
+      FROM "direct_messages" dm
+      WHERE dm."authorId" = ${req.user!.id} OR dm."targetId" = ${req.user!.id}
+      GROUP BY "otherUserId"
+      ORDER BY "lastMessageAt" DESC
+    `;
+
+    // Get user details for each conversation
+    const conversationsWithUsers = await Promise.all(
+      (conversations as any[]).map(async (conv) => {
+        const otherUser = await prisma.user.findUnique({
+          where: { id: conv.otherUserId },
+          select: {
+            id: true,
+            username: true,
+            displayName: true,
+            avatar: true,
+            status: true
+          }
+        });
+
+        // Get last message
+        const lastMessage = await prisma.directMessage.findFirst({
+          where: {
+            OR: [
+              { authorId: req.user!.id, targetId: conv.otherUserId },
+              { authorId: conv.otherUserId, targetId: req.user!.id }
+            ]
+          },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          include: {
+            author: {
+              select: { id: true, username: true, displayName: true, avatar: true }
+            }
+          }
+        });
+
+        // Check if they're friends
+        const friendship = await prisma.friendship.findFirst({
+          where: {
+            OR: [
+              { senderId: req.user!.id, receiverId: conv.otherUserId, status: 'ACCEPTED' },
+              { senderId: conv.otherUserId, receiverId: req.user!.id, status: 'ACCEPTED' }
+            ]
+          }
+        });
+
+        return {
+          id: conv.otherUserId,
+          user: otherUser,
+          lastMessage: lastMessage,
+          lastMessageAt: conv.lastMessageAt,
+          messageCount: parseInt(conv.messageCount),
+          isFriend: !!friendship
+        };
+      })
+    );
+
+    res.json(conversationsWithUsers.filter(conv => conv.user)); // Filter out deleted users
+  } catch (error) {
+    console.error('Get DM conversations error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get messages in a DM conversation
+app.get('/api/dms/:userId/messages', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+   const userId = req.params.userId as string;  
+    const currentUserId = req.user!.id as string;
+    const { before, limit = '50' } = req.query;
+
+    // Check if users are friends or have previous messages
+    const canDM = await checkCanDM(req.user!.id, userId);
+    if (!canDM) {
+      return res.status(403).json({ error: 'Cannot access this conversation' });
+    }
+
+    const messages = await prisma.directMessage.findMany({
+      where: {
+        OR: [
+          { authorId: req.user!.id, targetId: userId },
+          { authorId: userId, targetId: req.user!.id }
+        ],
+        ...(before && { createdAt: { lt: new Date(before as string) } })
+      },
+      include: {
+        author: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        },
+        attachments: true
+      },
+      orderBy: { createdAt: 'desc' },
+      take: parseInt(limit as string)
+    });
+
+    res.json(messages.reverse()); // Oldest first
+  } catch (error) {
+    console.error('Get DM messages error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Send a direct message
+app.post('/api/dms/:userId/messages', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId  = req.params.userId as string;
+    const { content, attachments } = req.body;
+
+    if (userId === req.user!.id) {
+      return res.status(400).json({ error: 'Cannot send message to yourself' });
+    }
+
+    if (!content && (!attachments || attachments.length === 0)) {
+      return res.status(400).json({ error: 'Message content or attachments required' });
+    }
+
+    // Check if users can DM each other
+    const canDM = await checkCanDM(req.user!.id, userId);
+    if (!canDM) {
+      return res.status(403).json({ error: 'Cannot send message to this user' });
+    }
+
+    const message = await prisma.directMessage.create({
+      data: {
+        content,
+        authorId: req.user!.id,
+        targetId: userId,
+        ...(attachments?.length > 0 && {
+          attachments: {
+            create: attachments.map((a: any) => ({
+              url: a.url,
+              filename: a.filename,
+              size: a.size,
+              contentType: a.contentType,
+            })),
+          },
+        }),
+      },
+      include: {
+        author: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        },
+        attachments: true
+      }
+    });
+
+    // Publish to Redis for real-time updates
+    await redis.publish('direct_message', JSON.stringify({
+      type: 'new_dm',
+      targetId: userId,
+      senderId: req.user!.id,
+      message
+    }));
+
+    res.status(201).json(message);
+  } catch (error) {
+    console.error('Send DM error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create or get DM conversation
+app.post('/api/dms/:userId', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const userId  = req.params.userId as string
+
+    if (userId === req.user!.id) {
+      return res.status(400).json({ error: 'Cannot start conversation with yourself' });
+    }
+
+    // Check if users can DM each other
+    const canDM = await checkCanDM(req.user!.id, userId);
+    if (!canDM) {
+      return res.status(403).json({ error: 'Cannot start conversation with this user' });
+    }
+
+    // Get user details
+    const otherUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        username: true,
+        displayName: true,
+        avatar: true,
+        status: true
+      }
+    });
+
+    if (!otherUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      id: userId,
+      user: otherUser,
+      type: 'DM'
+    });
+  } catch (error) {
+    console.error('Create DM conversation error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Helper function to check if users can DM each other
+async function checkCanDM(userId1: string, userId2: string): Promise<boolean> {
+  // Check if users are friends
+  const friendship = await prisma.friendship.findFirst({
+    where: {
+      OR: [
+        { senderId: userId1, receiverId: userId2, status: 'ACCEPTED' },
+        { senderId: userId2, receiverId: userId1, status: 'ACCEPTED' }
+      ]
+    }
+  });
+
+  if (friendship) return true;
+
+  // Check if they have previous messages (allows continuation of existing conversations)
+  const existingMessages = await prisma.directMessage.findFirst({
+    where: {
+      OR: [
+        { authorId: userId1, targetId: userId2 },
+        { authorId: userId2, targetId: userId1 }
+      ]
+    }
+  });
+
+  if (existingMessages) return true;
+
+  // Check if they're in the same server (optional - allows server members to DM)
+  const commonServer = await prisma.serverMember.findFirst({
+    where: {
+      userId: userId1,
+      server: {
+        members: {
+          some: { userId: userId2 }
+        }
+      }
+    }
+  });
+
+  return !!commonServer;
+}
+
+// Delete a DM message
+app.delete('/api/dms/messages/:messageId', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const messageId  = req.params.messageId as string;
+
+    const message = await prisma.directMessage.findUnique({
+      where: { id: messageId },
+      select: { id: true, authorId: true, targetId: true }
+    });
+
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    if (message.authorId !== req.user!.id) {
+      return res.status(403).json({ error: 'Can only delete your own messages' });
+    }
+
+    await prisma.directMessage.delete({ where: { id: messageId } });
+
+    // Publish delete event
+    await redis.publish('direct_message', JSON.stringify({
+      type: 'dm_deleted',
+      targetId: message.targetId,
+      senderId: req.user!.id,
+      messageId
+    }));
+
+    res.json({ message: 'Message deleted' });
+  } catch (error) {
+    console.error('Delete DM error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark DM conversation as read (optional feature)
+app.post('/api/dms/:userId/read', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // You could implement read receipts here by storing last read timestamps
+    // For now, just return success
+    res.json({ message: 'Conversation marked as read' });
+  } catch (error) {
+    console.error('Mark DM read error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+
 
 // Setup WebSocket
 setupWebSocket(server, prisma, redis,app);
