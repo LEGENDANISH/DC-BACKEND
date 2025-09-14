@@ -1622,10 +1622,26 @@ app.get('/api/friends', authenticateToken, async (req: AuthRequest, res) => {
       },
       include: {
         sender: {
-          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+          select: { 
+            id: true, 
+            username: true, 
+            displayName: true, 
+            avatar: true, 
+            status: true,
+            bio: true,          // ✅ add bio
+            createdAt: true     // ✅ joining date
+          }
         },
         receiver: {
-          select: { id: true, username: true, displayName: true, avatar: true, status: true }
+          select: { 
+            id: true, 
+            username: true, 
+            displayName: true, 
+            avatar: true, 
+            status: true,
+            bio: true,          // ✅ add bio
+            createdAt: true     // ✅ joining date
+          }
         }
       }
     });
@@ -1636,7 +1652,7 @@ app.get('/api/friends', authenticateToken, async (req: AuthRequest, res) => {
       return {
         ...friend,
         friendshipId: friendship.id,
-        friendsSince: friendship.createdAt
+        friendsSince: friendship.createdAt // ✅ when they became friends
       };
     });
 
@@ -1654,6 +1670,7 @@ app.get('/api/friends', authenticateToken, async (req: AuthRequest, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // Remove friend
 app.delete('/api/friends/:friendId', authenticateToken, async (req: AuthRequest, res) => {
@@ -2113,6 +2130,62 @@ app.post('/api/dms/:userId/read', authenticateToken, async (req: AuthRequest, re
   }
 });
 
+// Edit a DM message
+app.patch('/api/dms/messages/:messageId', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const messageId = req.params.messageId as string;
+    const { content } = req.body;
+
+    if (!content || content.trim() === "") {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    // Find the message
+    const message = await prisma.directMessage.findUnique({
+      where: { id: messageId },
+      select: { id: true, authorId: true, targetId: true }
+    });
+
+    if (!message) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    // Only author can edit
+    if (message.authorId !== req.user!.id) {
+      return res.status(403).json({ error: 'You can only edit your own messages' });
+    }
+
+    // Update message
+    const updatedMessage = await prisma.directMessage.update({
+      where: { id: messageId },
+      data: {
+        content,
+        updatedAt: new Date(),
+            edited: true,
+
+      },
+      include: {
+        author: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        },
+        attachments: true
+      }
+    });
+
+    // Publish update to Redis for real-time sync
+    await redis.publish('direct_message', JSON.stringify({
+      type: 'dm_updated',
+      targetId: message.targetId,
+      senderId: req.user!.id,
+      message: updatedMessage
+    }));
+
+    res.json(updatedMessage);
+  } catch (error) {
+    console.error('Edit DM error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 
 
