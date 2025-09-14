@@ -1133,6 +1133,9 @@
             io.to(`user:${data.targetId}`).emit('direct_message_deleted', {
               messageId: data.messageId
             });
+             io.to(`user:${data.senderId}`).emit('direct_message_deleted', {
+            messageId: data.messageId
+          });
             break;
             
         }
