@@ -35,6 +35,10 @@ model User {
   voiceStates   VoiceState[]
     participants   ChannelParticipant[]       // 👈 add this
 
+ // 👇 Add these to fix relation error
+  outgoingCalls  Call[] @relation("CallerCalls")
+  incomingCalls  Call[] @relation("CalleeCalls")
+
 
   @@map("users")
 }
@@ -354,6 +358,42 @@ model EmbedField {
 
   @@map("embed_fields")
 }
+
+//
+model Call {
+  id          String      @id @default(cuid())
+  callerId    String
+  calleeId    String
+  type        CallType    @default(VOICE)
+  status      CallStatus  @default(PENDING)
+  startedAt   DateTime?
+  endedAt     DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  caller      User @relation("CallerCalls", fields: [callerId], references: [id], onDelete: Cascade)
+  callee      User @relation("CalleeCalls", fields: [calleeId], references: [id], onDelete: Cascade)
+
+  @@map("calls")
+}
+
+enum CallType {
+  VOICE
+  VIDEO
+}
+
+enum CallStatus {
+  PENDING
+  RINGING
+  ACCEPTED
+  DECLINED
+  ENDED
+  MISSED
+  BUSY
+}
+
+//
+
 
 // Enums
 enum UserStatus {

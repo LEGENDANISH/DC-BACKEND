@@ -2187,6 +2187,94 @@ app.patch('/api/dms/messages/:messageId', authenticateToken, async (req: AuthReq
   }
 });
 
+// REST API Endpoints for call history and management
+
+// Get call history for a user
+app.get('/api/calls/history', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { page = '1', limit = '20', type } = req.query;
+    const skip = (parseInt(page as string) - 1) * parseInt(limit as string);
+
+    const calls = await prisma.call.findMany({
+      where: {
+        OR: [
+          { callerId: req.user!.id },
+          { calleeId: req.user!.id }
+        ],
+        ...(type && { type: (type as string).toUpperCase() as any })
+      },
+      include: {
+        caller: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        },
+        callee: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      skip,
+      take: parseInt(limit as string)
+    });
+
+    res.json(calls.map(call => ({
+      ...call,
+      isIncoming: call.calleeId === req.user!.id,
+      otherParticipant: call.callerId === req.user!.id ? call.callee : call.caller,
+      duration: call.startedAt && call.endedAt 
+        ? Math.floor((call.endedAt.getTime() - call.startedAt.getTime()) / 1000)
+        : null
+    })));
+  } catch (error) {
+    console.error('Get call history error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get active call for user
+app.get('/api/calls/active', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const activeCallId = await redis.get(`user_in_call:${req.user!.id}`);
+    
+    if (!activeCallId) {
+      return res.json({ activeCall: null });
+    }
+
+    const callState = await redis.get(`call:${activeCallId}`);
+    if (!callState) {
+      await redis.del(`user_in_call:${req.user!.id}`);
+      return res.json({ activeCall: null });
+    }
+
+    const state = JSON.parse(callState);
+    const call = await prisma.call.findUnique({
+      where: { id: activeCallId },
+      include: {
+        caller: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        },
+        callee: {
+          select: { id: true, username: true, displayName: true, avatar: true }
+        }
+      }
+    });
+
+    if (!call) {
+      await redis.del(`user_in_call:${req.user!.id}`);
+      return res.json({ activeCall: null });
+    }
+
+    res.json({
+      activeCall: {
+        ...call,
+        otherParticipant: call.callerId === req.user!.id ? call.callee : call.caller,
+        isIncoming: call.calleeId === req.user!.id
+      }
+    });
+  } catch (error) {
+    console.error('Get active call error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 
 // Setup WebSocket

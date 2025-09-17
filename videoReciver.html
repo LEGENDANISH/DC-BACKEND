@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Call Test - Receiver</title>
+    <!-- Include Socket.IO Client Library -->
+    <script src="/socket.io/socket.io.js"></script>
+    <!-- If serving from a different origin, use the full URL: -->
+    <!-- <script src="http://localhost:YOUR_SERVER_PORT/socket.io/socket.io.js"></script> -->
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background-color: #f0f8ff; } /* Slightly different background */
+        video { width: 300px; height: 200px; border: 1px solid #ccc; margin: 5px; }
+        #localVideo { background-color: #eee; }
+        #remoteVideo { background-color: #ddd; }
+        button { padding: 10px; margin: 5px; }
+        #callControls { margin-top: 20px; }
+        #messages { margin-top: 20px; white-space: pre-wrap; border: 1px solid #999; padding: 10px; height: 150px; overflow-y: scroll; background-color: #fff; }
+        .highlight { background-color: #ffff99; } /* Highlight for incoming call */
+    </style>
+</head>
+<body>
+    <h1>WebRTC Call Test - RECEIVER</h1> <!-- Clear indication -->
+    
+    <div>
+        <video id="localVideo" autoplay muted></video> <!-- Muted to avoid feedback -->
+        <video id="remoteVideo" autoplay></video>
+    </div>
+
+    <div id="callControls">
+        <!-- These buttons are primarily for the caller. Receiver uses accept/decline when incoming call arrives -->
+        <button id="initiateCallBtn" disabled>Initiate Call (Voice)</button>
+        <button id="initiateVideoCallBtn" disabled>Initiate Call (Video)</button>
+        <button id="acceptCallBtn" disabled>Accept Call</button>
+        <button id="declineCallBtn" disabled>Decline Call</button>
+        <button id="endCallBtn" disabled>End Call</button>
+        <button id="toggleMuteBtn" disabled>Mute/Unmute</button>
+        <button id="toggleVideoBtn" disabled>Enable/Disable Video</button>
+        <button id="startScreenShareBtn" disabled>Start Screen Share</button>
+        <button id="stopScreenShareBtn" disabled>Stop Screen Share</button>
+    </div>
+
+    <div>
+        <h3>Messages:</h3>
+        <div id="messages"></div>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        // IMPORTANT: Replace with the JWT token for THIS RECEIVER user
+        const authToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbWZoOHUzZ2YwMDAwaTJjODVsM3B6eGE2IiwiZW1haWwiOiJhbmlzaDJAZXhhbXBsZS5jb20iLCJpYXQiOjE3NTc3ODcyMDcsImV4cCI6MTc1ODM5MjAwN30.7VYJ1J1J1J1J1J1J1J1J1J1J1J1J1J1J1J1J1J1J1J1'; // *** REPLACE WITH RECEIVER'S TOKEN ***
+        // IMPORTANT: Replace with the ID of the USER WHO WILL CALL THIS RECEIVER (i.e., the caller's ID)
+        const targetUserId = 'cmeyhz23r000ri2fcyyir46ck'; // *** REPLACE WITH CALLER'S USER ID ***
+
+        // --- State ---
+        let socket;
+        let currentCallId = null;
+        let isAudioEnabled = true;
+        let isVideoEnabled = true;
+        let peerConnection = null;
+        let localStream = null;
+        let remoteStream = null;
+
+        // --- DOM Elements ---
+        const messagesDiv = document.getElementById('messages');
+        const initiateCallBtn = document.getElementById('initiateCallBtn');
+        const initiateVideoCallBtn = document.getElementById('initiateVideoCallBtn');
+        const acceptCallBtn = document.getElementById('acceptCallBtn');
+        const declineCallBtn = document.getElementById('declineCallBtn');
+        const endCallBtn = document.getElementById('endCallBtn');
+        const toggleMuteBtn = document.getElementById('toggleMuteBtn');
+        const toggleVideoBtn = document.getElementById('toggleVideoBtn');
+        const startScreenShareBtn = document.getElementById('startScreenShareBtn');
+        const stopScreenShareBtn = document.getElementById('stopScreenShareBtn');
+        const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
+
+        // --- Utility ---
+        function logMessage(message) {
+            const time = `[${new Date().toLocaleTimeString()}]`;
+            messagesDiv.textContent += `${time} ${message}\n`;
+            messagesDiv.scrollTop = messagesDiv.scrollHeight; // Auto-scroll
+        }
+
+        function highlightMessage(message) {
+             const time = `[${new Date().toLocaleTimeString()}]`;
+             messagesDiv.innerHTML += `<span class="highlight">${time} ${message}</span>\n`; // Use innerHTML for span
+             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function disableCallButtons() {
+            [acceptCallBtn, declineCallBtn, endCallBtn, toggleMuteBtn,
+             toggleVideoBtn, startScreenShareBtn, stopScreenShareBtn].forEach(btn => btn.disabled = true);
+        }
+
+        function enableInCallButtons() {
+             endCallBtn.disabled = false;
+             toggleMuteBtn.disabled = false;
+             toggleVideoBtn.disabled = false;
+             startScreenShareBtn.disabled = false;
+             // stopScreenShareBtn is enabled only when sharing starts
+        }
+
+        // --- WebRTC Helper Functions ---
+        // Basic STUN server configuration
+        const configuration = {
+             iceServers: [
+                 { urls: 'stun:stun.l.google.com:19302' },
+                 { urls: 'stun:stun1.l.google.com:19302' }
+             ]
+        };
+
+        function createPeerConnection() {
+            if (peerConnection) {
+                console.warn("PeerConnection already exists!");
+                return peerConnection;
+            }
+
+            peerConnection = new RTCPeerConnection(configuration);
+
+            // Add local stream tracks to the connection
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+            }
+
+            // Handle remote stream
+            peerConnection.ontrack = (event) => {
+                console.log("Received remote stream track:", event.track, "Streams:", event.streams);
+                if (!remoteStream) {
+                    remoteStream = event.streams[0];
+                    remoteVideo.srcObject = remoteStream;
+                    logMessage("Remote stream received and set to remoteVideo.");
+                } else {
+                    // If remoteStream already exists, add track to it
+                    remoteStream.addTrack(event.track);
+                }
+            };
+
+            // Handle ICE candidates
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate && currentCallId) {
+                    console.log("Sending ICE candidate:", event.candidate);
+                    socket.emit('webrtc_ice_candidate', {
+                        callId: currentCallId,
+                        targetUserId: targetUserId, // Send to the caller
+                        candidate: event.candidate
+                    });
+                }
+            };
+
+            // Handle connection state changes (optional but useful for debugging)
+            peerConnection.onconnectionstatechange = () => {
+                logMessage(`PeerConnection state: ${peerConnection.connectionState}`);
+                if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed') {
+                    logMessage("PeerConnection disconnected or failed. Ending call.");
+                    if (currentCallId) {
+                         socket.emit('call_end', { callId: currentCallId });
+                    }
+                }
+            };
+
+            peerConnection.onsignalingstatechange = () => {
+                logMessage(`Signaling state: ${peerConnection.signalingState}`);
+            };
+
+            peerConnection.oniceconnectionstatechange = () => {
+                 logMessage(`ICE connection state: ${peerConnection.iceConnectionState}`);
+            };
+
+            logMessage("PeerConnection created.");
+            return peerConnection;
+        }
+
+        async function getUserMedia(constraints = { audio: true, video: true }) {
+            try {
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+                localStream = await navigator.mediaDevices.getUserMedia(constraints);
+                localVideo.srcObject = localStream;
+                logMessage(`Local stream acquired (${constraints.audio ? 'audio' : 'no audio'}, ${constraints.video ? 'video' : 'no video'}).`);
+                return localStream;
+            } catch (err) {
+                console.error('getUserMedia error:', err);
+                logMessage(`Error getting local media: ${err.name} - ${err.message}`);
+                throw err; // Re-throw to handle in calling function
+            }
+        }
+
+        // --- Socket.IO Connection and Event Listeners ---
+        function connectSocket() {
+            socket = io({
+                auth: {
+                    token: authToken
+                }
+            });
+
+            socket.on('connect', () => {
+                logMessage("Connected to Socket.IO server as RECEIVER.");
+                // Receiver typically doesn't initiate calls immediately
+                // initiateCallBtn.disabled = false;
+                // initiateVideoCallBtn.disabled = false;
+            });
+
+            socket.on('connect_error', (err) => {
+                 logMessage(`Connection Error: ${err.message}`);
+                 disableCallButtons();
+                 // initiateCallBtn.disabled = true;
+                 // initiateVideoCallBtn.disabled = true;
+            });
+
+            socket.on('disconnect', (reason) => {
+                logMessage(`Disconnected: ${reason}`);
+                disableCallButtons();
+                // initiateCallBtn.disabled = true;
+                // initiateVideoCallBtn.disabled = true;
+                currentCallId = null;
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
+                }
+                localVideo.srcObject = null;
+                remoteVideo.srcObject = null;
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+            });
+
+            // --- Call Signaling Events ---
+
+            socket.on('call_incoming', async (data) => {
+                highlightMessage(`>>> INCOMING CALL from ${data.caller.username} (${data.type}) <<<`);
+                currentCallId = data.callId;
+                acceptCallBtn.disabled = false;
+                declineCallBtn.disabled = false;
+
+                // --- Auto-Accept Logic for Testing ---
+                // Uncomment the lines below to auto-accept incoming calls for easier testing
+                /*
+                logMessage("Auto-accepting incoming call in 2 seconds...");
+                setTimeout(async () => {
+                    if (currentCallId === data.callId && acceptCallBtn.disabled === false) {
+                        logMessage("Auto-accept triggered.");
+                        // Get media before accepting
+                        try {
+                            const constraints = data.type === 'video' ? { audio: true, video: true } : { audio: true, video: false };
+                            await getUserMedia(constraints);
+                            createPeerConnection(); // Create PC after getting media
+                            socket.emit('call_accept', { callId: data.callId });
+                            acceptCallBtn.disabled = true;
+                            declineCallBtn.disabled = true;
+                        } catch (err) {
+                            logMessage(`Failed to get media for auto-accept: ${err.message}`);
+                            socket.emit('call_decline', { callId: data.callId });
+                            currentCallId = null;
+                            disableCallButtons();
+                        }
+                    }
+                }, 2000);
+                */
+            });
+
+            socket.on('call_initiated', (data) => {
+                // Receiver usually doesn't initiate, but might if they call back
+                logMessage(`Call initiated to ${data.callee.username}. Waiting for response...`);
+                currentCallId = data.callId;
+                disableCallButtons();
+            });
+
+            socket.on('call_accepted', async (data) => {
+                logMessage(`Call accepted. Call ID: ${data.callId}`);
+                currentCallId = data.callId;
+                enableInCallButtons();
+
+                // --- START WEBRTC NEGOTIATION AS CALLER ---
+                try {
+                    // Ensure PeerConnection exists
+                    if (!peerConnection) {
+                        createPeerConnection();
+                    }
+
+                    // Ensure local stream is added to PC if not already done
+                    if (localStream) {
+                        localStream.getTracks().forEach(track => {
+                            if (!peerConnection.getSenders().find(s => s.track === track)) {
+                                peerConnection.addTrack(track, localStream);
+                                logMessage(`Added track ${track.kind} to PeerConnection.`);
+                            }
+                        });
+                    } else {
+                         logMessage("Warning: No local stream found when call was accepted.");
+                    }
+
+                    // Create Offer
+                    logMessage("Creating WebRTC offer...");
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+                    logMessage("Local description (offer) set.");
+
+                    // Send Offer via Socket.IO
+                    socket.emit('webrtc_offer', {
+                        callId: currentCallId,
+                        targetUserId: targetUserId, // Send to the callee
+                        offer: peerConnection.localDescription
+                    });
+                    logMessage("WebRTC offer sent.");
+                } catch (err) {
+                    console.error('WebRTC Offer Error:', err);
+                    logMessage(`WebRTC Offer Error: ${err.message}`);
+                    socket.emit('call_end', { callId: currentCallId });
+                }
+            });
+
+            socket.on('call_ended', (data) => {
+                logMessage(`Call ended. Reason: ${data.reason}`);
+                currentCallId = null;
+                disableCallButtons();
+                // initiateCallBtn.disabled = false;
+                // initiateVideoCallBtn.disabled = false;
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
+                }
+                localVideo.srcObject = null;
+                remoteVideo.srcObject = null;
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                    logMessage("PeerConnection closed.");
+                }
+            });
+
+            socket.on('call_error', (data) => {
+                logMessage(`Call Error: ${data.message}`);
+                if (!currentCallId) {
+                    // initiateCallBtn.disabled = false;
+                    // initiateVideoCallBtn.disabled = false;
+                } else {
+                    // If in a call and error occurs, end it
+                    if (currentCallId) {
+                         socket.emit('call_end', { callId: currentCallId });
+                    }
+                }
+            });
+
+            // --- WebRTC Signaling Events ---
+            socket.on('webrtc_offer', async (data) => {
+                logMessage(`Received WebRTC Offer from ${data.senderId}`);
+                try {
+                    // Ensure PeerConnection exists for callee
+                    if (!peerConnection) {
+                        createPeerConnection();
+                    }
+                    // Set remote description
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                    logMessage("Remote description (offer) set.");
+
+                    // Create Answer
+                    logMessage("Creating WebRTC answer...");
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    logMessage("Local description (answer) set.");
+
+                    // Send Answer via Socket.IO
+                    socket.emit('webrtc_answer', {
+                        callId: data.callId,
+                        targetUserId: data.senderId, // Send back to the offerer
+                        answer: peerConnection.localDescription
+                    });
+                    logMessage("WebRTC answer sent.");
+                } catch (err) {
+                    console.error('Error handling WebRTC offer:', err);
+                    logMessage(`Error handling offer: ${err.message}`);
+                    socket.emit('call_end', { callId: data.callId });
+                }
+            });
+
+            socket.on('webrtc_answer', async (data) => {
+                logMessage(`Received WebRTC Answer from ${data.senderId}`);
+                try {
+                    // Set remote description (as the offerer)
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                    logMessage("Remote description (answer) set. Connection should establish now.");
+                } catch (err) {
+                    console.error('Error handling WebRTC answer:', err);
+                    logMessage(`Error handling answer: ${err.message}`);
+                }
+            });
+
+            socket.on('webrtc_ice_candidate', async (data) => {
+                // logMessage(`Received ICE Candidate from ${data.senderId}`); // Very verbose
+                try {
+                   await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                   // logMessage(`Added ICE candidate.`); // Can be frequent
+                } catch (err) {
+                    // console.error('Error adding received ICE candidate:', err); // Can be frequent
+                    // logMessage(`Error adding ICE candidate: ${err.message}`); // Can be frequent
+                }
+            });
+
+            // --- Other Call Events ---
+            socket.on('screen_share_started', (data) => {
+                 logMessage(`Screen share started by ${data.userId} (${data.username})`);
+                 stopScreenShareBtn.disabled = false;
+                 // The remote stream should automatically update to show the screen share
+                 // Note: This simple UI doesn't handle replacing the remote video stream.
+                 // A full app would need to manage stream changes.
+            });
+
+            socket.on('screen_share_stopped', (data) => {
+                 logMessage(`Screen share stopped by ${data.userId}`);
+                 stopScreenShareBtn.disabled = true;
+                 // The remote stream should revert to camera/video
+            });
+
+            socket.on('participant_state_update', (data) => {
+                 logMessage(`Participant ${data.userId} updated state: Audio=${data.audioEnabled}, Video=${data.videoEnabled}`);
+                 // Update UI to reflect remote participant's mute/video status (e.g., icons)
+            });
+
+        }
+
+        // --- Button Event Listeners ---
+        initiateCallBtn.addEventListener('click', async () => {
+            if (socket && socket.connected) {
+                logMessage("Initiating voice call...");
+                // Get media first
+                try {
+                    await getUserMedia({ audio: true, video: false });
+                    createPeerConnection(); // Create PC after getting media
+                    socket.emit('call_initiate', {
+                        targetUserId: targetUserId,
+                        type: 'voice'
+                    });
+                } catch (err) {
+                    logMessage(`Failed to initiate voice call: ${err.message}`);
+                }
+            } else {
+                logMessage("Not connected to server.");
+            }
+        });
+
+        initiateVideoCallBtn.addEventListener('click', async () => {
+            if (socket && socket.connected) {
+                logMessage("Initiating video call...");
+                 // Get media first
+                try {
+                    await getUserMedia({ audio: true, video: true });
+                    createPeerConnection(); // Create PC after getting media
+                    socket.emit('call_initiate', {
+                        targetUserId: targetUserId,
+                        type: 'video'
+                    });
+                } catch (err) {
+                    logMessage(`Failed to initiate video call: ${err.message}`);
+                }
+            } else {
+                logMessage("Not connected to server.");
+            }
+        });
+
+        acceptCallBtn.addEventListener('click', async () => {
+            if (socket && currentCallId) {
+                logMessage("Accepting call...");
+                // Get media before accepting
+                try {
+                    // Determine call type from stored state or assume default
+                    // A more robust way would be to store the incoming call details
+                    // For simplicity, let's assume video if video button is enabled (which it isn't initially)
+                    // Let's get audio always, and video if the call type was likely video
+                    // We need to infer type. Let's assume video for now or get it from a global if stored.
+                    // Simpler: get both and disable video track if needed later.
+                    await getUserMedia({ audio: true, video: true });
+                    createPeerConnection(); // Create PC after getting media
+                    socket.emit('call_accept', { callId: currentCallId });
+                    acceptCallBtn.disabled = true;
+                    declineCallBtn.disabled = true;
+                } catch (err) {
+                    logMessage(`Failed to accept call (media error): ${err.message}`);
+                    socket.emit('call_decline', { callId: currentCallId });
+                    currentCallId = null;
+                    disableCallButtons();
+                }
+            }
+        });
+
+        declineCallBtn.addEventListener('click', () => {
+            if (socket && currentCallId) {
+                logMessage("Declining call...");
+                socket.emit('call_decline', { callId: currentCallId });
+                acceptCallBtn.disabled = true;
+                declineCallBtn.disabled = true;
+                currentCallId = null; // Reset locally
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localStream = null;
+                }
+                localVideo.srcObject = null;
+            }
+        });
+
+        endCallBtn.addEventListener('click', () => {
+            if (socket && currentCallId) {
+                logMessage("Ending call...");
+                socket.emit('call_end', { callId: currentCallId });
+                // UI update handled by 'call_ended' event
+            }
+        });
+
+        toggleMuteBtn.addEventListener('click', () => {
+             if (socket && currentCallId && localStream) {
+                 isAudioEnabled = !isAudioEnabled;
+                 logMessage(`Toggling audio: ${isAudioEnabled ? 'Enabled' : 'Disabled'}`);
+
+                 localStream.getAudioTracks().forEach(track => {
+                     track.enabled = isAudioEnabled;
+                     logMessage(`Audio track ${track.id} ${isAudioEnabled ? 'unmuted' : 'muted'}`);
+                 });
+
+                 socket.emit('call_state_update', {
+                     callId: currentCallId,
+                     audioEnabled: isAudioEnabled,
+                     videoEnabled: isVideoEnabled
+                 });
+             } else {
+                 logMessage("Cannot toggle mute: No active call or no local stream.");
+             }
+        });
+
+        toggleVideoBtn.addEventListener('click', () => {
+             if (socket && currentCallId && localStream) {
+                 isVideoEnabled = !isVideoEnabled;
+                 logMessage(`Toggling video: ${isVideoEnabled ? 'Enabled' : 'Disabled'}`);
+
+                 localStream.getVideoTracks().forEach(track => {
+                     track.enabled = isVideoEnabled;
+                     logMessage(`Video track ${track.id} ${isVideoEnabled ? 'enabled' : 'disabled'}`);
+                 });
+
+                 socket.emit('call_state_update', {
+                     callId: currentCallId,
+                     audioEnabled: isAudioEnabled,
+                     videoEnabled: isVideoEnabled
+                 });
+             } else {
+                 logMessage("Cannot toggle video: No active call or no local stream.");
+             }
+        });
+
+        startScreenShareBtn.addEventListener('click', async () => {
+             if (socket && currentCallId) {
+                 logMessage("Starting screen share...");
+                 try {
+                     // Get screen share stream
+                     const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                     logMessage("Screen share stream acquired.");
+
+                     // Stop sending the old video track
+                     if (localStream && peerConnection) {
+                         const videoTracks = localStream.getVideoTracks();
+                         videoTracks.forEach(track => {
+                             const sender = peerConnection.getSenders().find(s => s.track === track);
+                             if (sender) {
+                                 peerConnection.removeTrack(sender);
+                                 logMessage(`Removed old video track ${track.id} from PeerConnection.`);
+                             }
+                             track.stop(); // Stop the camera video track
+                         });
+                         // Remove video track from localStream
+                         videoTracks.forEach(track => localStream.removeTrack(track));
+                     }
+
+                     // Add screen share track to PeerConnection
+                     if (peerConnection && screenStream) {
+                         const screenTrack = screenStream.getVideoTracks()[0];
+                         peerConnection.addTrack(screenTrack, screenStream);
+                         logMessage(`Added screen share track ${screenTrack.id} to PeerConnection.`);
+
+                         // Update local video preview
+                         localVideo.srcObject = screenStream;
+
+                         // Listen for screen share end (user clicks 'Stop sharing')
+                         screenTrack.onended = () => {
+                              logMessage("User stopped screen sharing (via browser UI).");
+                              // Ideally, trigger stopScreenShareBtn click or call stop logic here
+                              // For now, just log. The 'screen_share_stop' event might not be sent
+                              // automatically, so manual click might still be needed in some cases.
+                              // You could emit 'screen_share_stop' here.
+                              socket.emit('screen_share_stop', { callId: currentCallId });
+                              stopScreenShareBtn.disabled = true;
+                         };
+
+                         // Notify server/other participant
+                         socket.emit('screen_share_start', { callId: currentCallId });
+                     }
+
+                 } catch (err) {
+                     if (err.name !== 'AbortError') { // User cancelling is not an error to log
+                         logMessage(`Error starting screen share: ${err.name} - ${err.message}`);
+                     } else {
+                         logMessage("Screen share cancelled by user.");
+                     }
+                 }
+             } else {
+                 logMessage("Cannot start screen share: No active call.");
+             }
+        });
+
+        stopScreenShareBtn.addEventListener('click', async () => {
+             if (socket && currentCallId) {
+                 logMessage("Stopping screen share...");
+                 try {
+                     // Stop screen share tracks
+                     if (localVideo.srcObject instanceof MediaStream) {
+                         localVideo.srcObject.getTracks().forEach(track => {
+                             track.stop();
+                             logMessage(`Stopped screen share track ${track.id}.`);
+                         });
+                     }
+
+                     // Remove screen share sender from PeerConnection
+                     if (peerConnection) {
+                         const senders = peerConnection.getSenders();
+                         senders.forEach(sender => {
+                             if (sender.track && sender.track.kind === 'video' && sender.track.label.includes('screen')) {
+                                 peerConnection.removeTrack(sender);
+                                 logMessage(`Removed screen share sender ${sender.track.id} from PeerConnection.`);
+                             }
+                         });
+                     }
+
+                     // Get camera video stream again
+                     const constraints = { video: isVideoEnabled, audio: false }; // Only video, audio already handled
+                     const newVideoStream = await navigator.mediaDevices.getUserMedia(constraints);
+                     const newVideoTrack = newVideoStream.getVideoTracks()[0];
+
+                     // Add new camera video track to PeerConnection
+                     if (peerConnection && localStream) {
+                         peerConnection.addTrack(newVideoTrack, newVideoStream);
+                         logMessage(`Added new camera video track ${newVideoTrack.id} to PeerConnection.`);
+
+                         // Add track back to localStream for consistency (optional)
+                         localStream.addTrack(newVideoTrack);
+
+                         // Update local video preview
+                         localVideo.srcObject = localStream; // Show combined local stream (audio + new video)
+                         // Or just show the new video stream if you manage them separately
+                         // localVideo.srcObject = newVideoStream;
+                     }
+
+                     // Notify server/other participant
+                     socket.emit('screen_share_stop', { callId: currentCallId });
+                     stopScreenShareBtn.disabled = true;
+                 } catch (err) {
+                     logMessage(`Error stopping screen share: ${err.message}`);
+                 }
+             } else {
+                 logMessage("Cannot stop screen share: No active call.");
+             }
+        });
+
+        // --- Initialize ---
+        connectSocket();
+
+    </script>
+</body>
+</html>

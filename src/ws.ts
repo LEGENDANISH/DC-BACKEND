@@ -3,6 +3,8 @@
   import { PrismaClient } from '@prisma/client';
   import Redis from 'ioredis';
   import jwt from 'jsonwebtoken';
+import { v4 as uuidv4 } from "uuid";
+
 
   interface AuthenticatedSocket extends Socket {
     userId?: string;
@@ -35,10 +37,27 @@
     video: boolean;
   }
 
+  interface Call {
+  id: string;
+  hostId: string;
+  participants: Set<string>;
+  createdAt: number;
+  metadata?: { audioOnly?: boolean };
+}
+
+// In-memory (replace with Redis if multi-instance)
+const activeCalls: Map<string, {
+  callId: string;
+  participants: string[];
+  type: string;
+  startTime: Date;
+}> = new Map();
+
+
   export function setupWebSocket(server: HTTPServer, prisma: PrismaClient, redis: Redis,app :Express.Application) {
     const io = new SocketIOServer(server, {
       cors: {
-      origin: ['http://localhost:3000', 'http://127.0.0.1:5500','http://localhost:5173',"http://127.0.0.1:5500'"], // 👈 add both origins
+      origin: ['http://localhost:3000', 'http://127.0.0.1:5500','http://localhost:5173','http://127.0.0.1:5500','"http://127.0.0.1:5501'], // 👈 add both origins
         methods: ['GET', 'POST'],
         credentials: true
       },
@@ -1107,6 +1126,566 @@
     });
   });
 
+
+//CALL/VIDEO CALL
+
+  io.on('connection', (socket: AuthenticatedSocket) => {
+
+    // Initiate a call
+    socket.on('call_initiate', async (data: {
+      targetUserId: string;
+      type: 'voice' | 'video';
+      isDM?: boolean;
+    }) => {
+      try {
+        const { targetUserId, type, isDM = true } = data;
+
+        if (!socket.userId) {
+          socket.emit('call_error', { message: 'Not authenticated' });
+          return;
+        }
+
+        if (targetUserId === socket.userId) {
+          socket.emit('call_error', { message: 'Cannot call yourself' });
+          return;
+        }
+
+        // Check if users can call each other (friends or same server)
+        if (isDM) {
+          const canCall = await checkCanCall(socket.userId, targetUserId);
+          if (!canCall) {
+            socket.emit('call_error', { message: 'Cannot call this user' });
+            return;
+          }
+        }
+
+        // Check if target user is online
+        const targetSocketId = await redis.get(`socket:${targetUserId}`);
+        if (!targetSocketId) {
+          socket.emit('call_error', { message: 'User is offline' });
+          return;
+        }
+
+        // Check if either user is already in a call
+        const callerInCall = await redis.get(`user_in_call:${socket.userId}`);
+        const calleeInCall = await redis.get(`user_in_call:${targetUserId}`);
+
+        if (callerInCall) {
+          socket.emit('call_error', { message: 'You are already in a call' });
+          return;
+        }
+
+        if (calleeInCall) {
+          socket.emit('call_error', { message: 'User is busy' });
+          return;
+        }
+
+        // Create call record in database
+        const call = await prisma.call.create({
+          data: {
+            callerId: socket.userId,
+            calleeId: targetUserId,
+            type: type.toUpperCase() as any,
+            status: 'RINGING'
+          },
+          include: {
+            caller: {
+              select: { id: true, username: true, displayName: true, avatar: true }
+            },
+            callee: {
+              select: { id: true, username: true, displayName: true, avatar: true }
+            }
+          }
+        });
+
+        // Store call state in Redis
+        await redis.setex(`call:${call.id}`, 300, JSON.stringify({
+          callId: call.id,
+          callerId: socket.userId,
+          calleeId: targetUserId,
+          type,
+          status: 'ringing',
+          createdAt: new Date().toISOString()
+        }));
+
+        // Mark users as potentially in call
+        await redis.setex(`user_in_call:${socket.userId}`, 300, call.id);
+        await redis.setex(`user_in_call:${targetUserId}`, 300, call.id);
+
+        // Join both users to call room
+        socket.join(`call:${call.id}`);
+        
+        // Notify target user of incoming call
+        io.to(targetSocketId).emit('call_incoming', {
+          callId: call.id,
+          caller: call.caller,
+          type,
+          timestamp: call.createdAt
+        });
+
+        // Confirm call initiated to caller
+        socket.emit('call_initiated', {
+          callId: call.id,
+          callee: call.callee,
+          type,
+          status: 'ringing'
+        });
+
+        // Auto-end call after 60 seconds if not answered
+        setTimeout(async () => {
+          const callState = await redis.get(`call:${call.id}`);
+          if (callState) {
+            const state = JSON.parse(callState);
+            if (state.status === 'ringing') {
+              await endCall(call.id, 'missed');
+            }
+          }
+        }, 60000);
+
+      } catch (error) {
+        console.error('Call initiate error:', error);
+        socket.emit('call_error', { message: 'Failed to initiate call' });
+      }
+    });
+
+    // Accept incoming call
+    socket.on('call_accept', async (data: { callId: string }) => {
+      try {
+        const { callId } = data;
+
+        const callState = await redis.get(`call:${callId}`);
+        if (!callState) {
+          socket.emit('call_error', { message: 'Call not found' });
+          return;
+        }
+
+        const state = JSON.parse(callState);
+        
+        if (state.calleeId !== socket.userId) {
+          socket.emit('call_error', { message: 'Not authorized' });
+          return;
+        }
+
+        if (state.status !== 'ringing') {
+          socket.emit('call_error', { message: 'Call is no longer active' });
+          return;
+        }
+
+        // Update call status
+        await prisma.call.update({
+          where: { id: callId },
+          data: { 
+            status: 'ACCEPTED',
+            startedAt: new Date()
+          }
+        });
+
+        // Update Redis state
+        state.status = 'active';
+        state.startedAt = new Date().toISOString();
+        await redis.setex(`call:${callId}`, 3600, JSON.stringify(state)); // 1 hour limit
+
+        // Join callee to call room
+        socket.join(`call:${callId}`);
+        
+        // Store active call
+        activeCalls.set(callId, {
+          callId,
+          participants: [state.callerId, state.calleeId],
+          type: state.type,
+          startTime: new Date()
+        });
+
+        // Notify both users that call is accepted
+        io.to(`call:${callId}`).emit('call_accepted', {
+          callId,
+          type: state.type,
+          participants: [state.callerId, state.calleeId]
+        });
+
+      } catch (error) {
+        console.error('Call accept error:', error);
+        socket.emit('call_error', { message: 'Failed to accept call' });
+      }
+    });
+
+    // Decline incoming call
+    socket.on('call_decline', async (data: { callId: string }) => {
+      try {
+        const { callId } = data;
+        await endCall(callId, 'declined');
+      } catch (error) {
+        console.error('Call decline error:', error);
+        socket.emit('call_error', { message: 'Failed to decline call' });
+      }
+    });
+
+    // End active call
+    socket.on('call_end', async (data: { callId: string }) => {
+      try {
+        const { callId } = data;
+        await endCall(callId, 'ended');
+      } catch (error) {
+        console.error('Call end error:', error);
+        socket.emit('call_error', { message: 'Failed to end call' });
+      }
+    });
+
+    // WebRTC Signaling
+    socket.on('webrtc_offer', async (data: {
+      callId: string;
+      targetUserId: string;
+      offer: RTCSessionDescriptionInit;
+    }) => {
+      try {
+        const { callId, targetUserId, offer } = data;
+
+        // Verify call exists and user is participant
+        if (!await verifyCallParticipant(callId, socket.userId!)) {
+          socket.emit('call_error', { message: 'Not authorized' });
+          return;
+        }
+
+        const targetSocketId = await redis.get(`socket:${targetUserId}`);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit('webrtc_offer', {
+            callId,
+            senderId: socket.userId,
+            offer
+          });
+        }
+
+      } catch (error) {
+        console.error('WebRTC offer error:', error);
+      }
+    });
+
+    socket.on('webrtc_answer', async (data: {
+      callId: string;
+      targetUserId: string;
+      answer: RTCSessionDescriptionInit;
+    }) => {
+      try {
+        const { callId, targetUserId, answer } = data;
+
+        if (!await verifyCallParticipant(callId, socket.userId!)) {
+          socket.emit('call_error', { message: 'Not authorized' });
+          return;
+        }
+
+        const targetSocketId = await redis.get(`socket:${targetUserId}`);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit('webrtc_answer', {
+            callId,
+            senderId: socket.userId,
+            answer
+          });
+        }
+
+      } catch (error) {
+        console.error('WebRTC answer error:', error);
+      }
+    });
+
+    socket.on('webrtc_ice_candidate', async (data: {
+      callId: string;
+      targetUserId: string;
+      candidate: RTCIceCandidateInit;
+    }) => {
+      try {
+        const { callId, targetUserId, candidate } = data;
+
+        if (!await verifyCallParticipant(callId, socket.userId!)) {
+          return;
+        }
+
+        const targetSocketId = await redis.get(`socket:${targetUserId}`);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit('webrtc_ice_candidate', {
+            callId,
+            senderId: socket.userId,
+            candidate
+          });
+        }
+
+      } catch (error) {
+        console.error('WebRTC ICE candidate error:', error);
+      }
+    });
+
+    // Screen sharing
+    socket.on('screen_share_start', async (data: { callId: string }) => {
+      try {
+        const { callId } = data;
+
+        if (!await verifyCallParticipant(callId, socket.userId!)) {
+          socket.emit('call_error', { message: 'Not authorized' });
+          return;
+        }
+
+        // Notify other participant about screen sharing
+        socket.to(`call:${callId}`).emit('screen_share_started', {
+          userId: socket.userId,
+          username: socket.user?.username
+        });
+
+        socket.emit('screen_share_start_confirmed', { callId });
+
+      } catch (error) {
+        console.error('Screen share start error:', error);
+      }
+    });
+
+    socket.on('screen_share_stop', async (data: { callId: string }) => {
+      try {
+        const { callId } = data;
+
+        if (!await verifyCallParticipant(callId, socket.userId!)) {
+          return;
+        }
+
+        socket.to(`call:${callId}`).emit('screen_share_stopped', {
+          userId: socket.userId
+        });
+
+      } catch (error) {
+        console.error('Screen share stop error:', error);
+      }
+    });
+
+    // Handle call state changes (mute, video toggle, etc.)
+// Modify the existing call_state_update handler
+socket.on('call_state_update', async (data: {
+  callId: string;
+  audioEnabled: boolean;
+  videoEnabled: boolean;
+  type?: 'voice' | 'video';
+}) => {
+  try {
+    const { callId, audioEnabled, videoEnabled, type } = data;
+
+    if (!await verifyCallParticipant(callId, socket.userId!)) {
+      return;
+    }
+
+    // Handle type change if provided
+    if (type) {
+      await prisma.call.update({
+        where: { id: callId },
+        data: { type: type.toUpperCase() as any }
+      });
+
+      const callState = await redis.get(`call:${callId}`);
+      if (callState) {
+        const state = JSON.parse(callState);
+        state.type = type;
+        await redis.setex(`call:${callId}`, 3600, JSON.stringify(state));
+      }
+
+      io.to(`call:${callId}`).emit('call_type_changed', {
+        callId,
+        newType: type
+      });
+    }
+
+    socket.to(`call:${callId}`).emit('participant_state_update', {
+      userId: socket.userId,
+      audioEnabled,
+      videoEnabled
+    });
+
+  } catch (error) {
+    console.error('Call state update error:', error);
+  }
+});
+
+
+// Add these to your existing socket connection handler
+
+// Switch call type during active call
+socket.on('call_type_switch', async (data: {
+  callId: string;
+  newType: 'voice' | 'video';
+}) => {
+  try {
+    const { callId, newType } = data;
+
+    if (!await verifyCallParticipant(callId, socket.userId!)) {
+      socket.emit('call_error', { message: 'Not authorized' });
+      return;
+    }
+
+    // Update call in database
+    await prisma.call.update({
+      where: { id: callId },
+      data: { type: newType.toUpperCase() as any }
+    });
+
+    // Update Redis state
+    const callState = await redis.get(`call:${callId}`);
+    if (callState) {
+      const state = JSON.parse(callState);
+      state.type = newType;
+      await redis.setex(`call:${callId}`, 3600, JSON.stringify(state));
+    }
+
+    // Notify participants
+    io.to(`call:${callId}`).emit('call_type_changed', {
+      callId,
+      newType
+    });
+
+  } catch (error) {
+    console.error('Call type switch error:', error);
+    socket.emit('call_error', { message: 'Failed to switch call type' });
+  }
+});
+
+
+// Add this helper function
+async function getCallType(callId: string): Promise<'voice' | 'video' | null> {
+  const callState = await redis.get(`call:${callId}`);
+  if (!callState) return null;
+
+  const state = JSON.parse(callState);
+  return state.type;
+}
+    // Handle disconnect during call
+    socket.on('disconnect', async () => {
+      if (socket.userId) {
+        // Find any active calls for this user
+        const userCallId = await redis.get(`user_in_call:${socket.userId}`);
+        if (userCallId) {
+          await endCall(userCallId, 'ended');
+        }
+      }
+    });
+
+    // Helper function to end a call
+    async function endCall(callId: string, reason: 'ended' | 'declined' | 'missed') {
+      try {
+        const callState = await redis.get(`call:${callId}`);
+        if (!callState) return;
+
+        const state = JSON.parse(callState);
+
+        // Update database
+        const statusMap = {
+          ended: 'ENDED',
+          declined: 'DECLINED', 
+          missed: 'MISSED'
+        };
+
+        await prisma.call.update({
+          where: { id: callId },
+          data: { 
+            status: statusMap[reason] as any,
+            endedAt: new Date()
+          }
+        });
+
+        // Clean up Redis
+        await redis.del(`call:${callId}`);
+        await redis.del(`user_in_call:${state.callerId}`);
+        await redis.del(`user_in_call:${state.calleeId}`);
+
+        // Remove from active calls
+        activeCalls.delete(callId);
+
+        // Notify participants
+        io.to(`call:${callId}`).emit('call_ended', {
+          callId,
+          reason,
+          endedBy: socket.userId
+        });
+
+        // Leave call room
+        io.in(`call:${callId}`).socketsLeave(`call:${callId}`);
+
+      } catch (error) {
+        console.error('End call error:', error);
+      }
+    }
+
+    // Helper function to verify call participant
+    async function verifyCallParticipant(callId: string, userId: string): Promise<boolean> {
+      const callState = await redis.get(`call:${callId}`);
+      if (!callState) return false;
+
+      const state = JSON.parse(callState);
+      return state.callerId === userId || state.calleeId === userId;
+    }
+
+    // Helper function to check if users can call each other
+    async function checkCanCall(userId1: string, userId2: string): Promise<boolean> {
+      // Check if users are friends
+      const friendship = await prisma.friendship.findFirst({
+        where: {
+          OR: [
+            { senderId: userId1, receiverId: userId2, status: 'ACCEPTED' },
+            { senderId: userId2, receiverId: userId1, status: 'ACCEPTED' }
+          ]
+        }
+      });
+
+      if (friendship) return true;
+
+      // Check if they're in the same server
+      const commonServer = await prisma.serverMember.findFirst({
+        where: {
+          userId: userId1,
+          server: {
+            members: {
+              some: { userId: userId2 }
+            }
+          }
+        }
+      });
+
+      return !!commonServer;
+    }
+  });
+
+  // Cleanup expired calls every minute
+  setInterval(async () => {
+    try {
+      const expiredCalls = await prisma.call.findMany({
+        where: {
+          status: 'RINGING',
+          createdAt: {
+            lt: new Date(Date.now() - 60000) // 1 minute ago
+          }
+        }
+      });
+
+      for (const call of expiredCalls) {
+        await prisma.call.update({
+          where: { id: call.id },
+          data: { 
+            status: 'MISSED',
+            endedAt: new Date()
+          }
+        });
+
+        await redis.del(`call:${call.id}`);
+        await redis.del(`user_in_call:${call.callerId}`);
+        await redis.del(`user_in_call:${call.calleeId}`);
+
+        activeCalls.delete(call.id);
+
+        io.to(`call:${call.id}`).emit('call_ended', {
+          callId: call.id,
+          reason: 'missed'
+        });
+      }
+    } catch (error) {
+      console.error('Call cleanup error:', error);
+    }
+  }, 60000);
+
+//
+
+  
   // Add Redis subscriber for friend-related events
   subscriber.subscribe('friend_request', 'direct_message');
 
@@ -1232,6 +1811,7 @@
       })
     ]);
 
+    
     return {
       friends: friends.map(f => ({
         ...(f.senderId === userId ? f.receiver : f.sender),
